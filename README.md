@@ -1,6 +1,6 @@
 # claude-tools
 
-Containerised Claude Code with a ready-made toolchain (node/npm, pyenv, SDKMAN!)
+Containerized Claude Code with a ready-made toolchain (node/npm, pyenv, SDKMAN!)
 and agents/settings version-controlled in this repository.
 
 ## Files
@@ -8,7 +8,7 @@ and agents/settings version-controlled in this repository.
 | File                   | Purpose                                                                  |
 |------------------------|--------------------------------------------------------------------------|
 | `Dockerfile`           | The image: debian + node/npm + claude + pyenv + SDKMAN! + non-sudo user  |
-| `docker-entrypoint.sh` | Entrypoint — initialises pyenv/SDKMAN! and runs `exec claude "$@"`       |
+| `docker-entrypoint.sh` | Entrypoint — initializes pyenv/SDKMAN! and runs `exec claude "$@"`       |
 | `build.sh`             | Builds the image, passing through the current user's uid/gid             |
 | `run-claude.sh`        | Runs the image with every mount wired up, forwarding arguments to claude |
 | `settings.json`        | User-level settings, mounted at `~/.claude/settings.json`                |

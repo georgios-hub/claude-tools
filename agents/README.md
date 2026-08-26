@@ -20,4 +20,4 @@ The agent's system prompt.
 The mount is read-write, so agents that Claude creates itself (via `/agents`)
 are written straight into this directory and can be committed.
 
-Usage: `./run.sh --agent my-agent`
+Usage: `./run-claude.sh --agent my-agent`

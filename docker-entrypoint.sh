@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Entrypoint: initialises SDKMAN!/pyenv and starts claude straight away.
+# Entrypoint: initializes SDKMAN!/pyenv and starts claude straight away.
 # Any arguments given to `docker run` are forwarded verbatim to claude,
 # e.g. --agent <name>, --model, -p "...", --dangerously-skip-permissions.
 #

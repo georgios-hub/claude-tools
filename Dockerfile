@@ -35,7 +35,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # 1. Base system packages plus the build dependencies pyenv needs.
 #    bubblewrap and socat are what Claude Code's own sandbox needs on Linux
 #    (filesystem isolation and the network filter respectively). They also
-#    require the container to be started with the security options that run.sh
+#    require the container to be started with the security options that run-claude.sh
 #    passes -- see the Sandbox section of the README.
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -135,7 +135,7 @@ RUN set -e; \
     if [ "${GRADLE_VERSION}" != "none" ]; then gradle --version; fi
 
 # ---------------------------------------------------------------------------
-# 7. Shell initialisation.
+# 7. Shell initialization.
 #    Debian's stock .bashrc returns early for non-interactive shells, so the
 #    init lives in its own file: prepended to .bashrc for interactive shells and
 #    exported as BASH_ENV for `bash -c` invocations. `sdk` in particular is a
