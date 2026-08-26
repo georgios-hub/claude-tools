@@ -10,11 +10,11 @@
 #   <repo>/settings.json  -> ~/.claude/settings.json (settings versioned in this repo)
 #
 # Usage:
-#   ./run.sh                                  # interactive claude in the current directory
-#   ./run.sh --agent code-reviewer            # any arguments are forwarded to claude
-#   ./run.sh -p "what does this repo do?"
-#   ./run.sh --dangerously-skip-permissions
-#   ./run.sh shell                            # bash inside the container instead of claude
+#   ./run-claude.sh                                  # interactive claude in the current directory
+#   ./run-claude.sh --agent code-reviewer            # any arguments are forwarded to claude
+#   ./run-claude.sh -p "what does this repo do?"
+#   ./run-claude.sh --dangerously-skip-permissions
+#   ./run-claude.sh shell                            # bash inside the container instead of claude
 #
 # Options handled by this script (they must come BEFORE the claude arguments):
 #   --image <tag>        image to run (default: claude-tools:latest)
@@ -30,7 +30,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks first: the script is meant to be symlinked onto PATH, and
+# agents/ and settings.json are located relative to the real file, not the link.
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
 
 IMAGE_TAG="${CLAUDE_TOOLS_IMAGE:-claude-tools:latest}"
 CONTAINER_USER="${CLAUDE_TOOLS_USER:-claude}"

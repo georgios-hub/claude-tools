@@ -76,4 +76,4 @@ docker build \
 
 echo
 echo "==> Done: ${IMAGE_TAG}"
-echo "    Run it with: ${SCRIPT_DIR}/run.sh [claude args...]"
+echo "    Run it with: ${SCRIPT_DIR}/run-claude.sh [claude args...]"

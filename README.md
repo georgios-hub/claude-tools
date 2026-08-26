@@ -10,7 +10,7 @@ and agents/settings version-controlled in this repository.
 | `Dockerfile`           | The image: debian + node/npm + claude + pyenv + SDKMAN! + non-sudo user  |
 | `docker-entrypoint.sh` | Entrypoint — initialises pyenv/SDKMAN! and runs `exec claude "$@"`       |
 | `build.sh`             | Builds the image, passing through the current user's uid/gid             |
-| `run.sh`               | Runs the image with every mount wired up, forwarding arguments to claude |
+| `run-claude.sh`        | Runs the image with every mount wired up, forwarding arguments to claude |
 | `settings.json`        | User-level settings, mounted at `~/.claude/settings.json`                |
 | `agents/`              | Your agents, mounted at `~/.claude/agents`                               |
 
@@ -39,12 +39,26 @@ The first build takes roughly 5–10 minutes, because `pyenv install` compiles C
 ## Run
 
 ```bash
-./run.sh                            # interactive claude in the current directory
-./run.sh --agent code-reviewer      # arguments are forwarded verbatim to claude
-./run.sh -p "what does this repo do?"
-./run.sh --dangerously-skip-permissions
-./run.sh shell                      # bash inside the container instead of claude
+./run-claude.sh                        # interactive claude in the current directory
+./run-claude.sh --agent code-reviewer  # arguments are forwarded verbatim to claude
+./run-claude.sh -p "what does this repo do?"
+./run-claude.sh --dangerously-skip-permissions
+./run-claude.sh shell                  # bash inside the container instead of claude
 ```
+
+### Putting it on PATH
+
+The script has to keep living in this repository, because it locates `agents/`
+and `settings.json` relative to itself. Symlink it instead of copying it — the
+script resolves the symlink before working out the repo directory:
+
+```bash
+ln -s "$PWD/run-claude.sh" ~/.local/bin/run-claude
+```
+
+Then `run-claude --agent my-agent` works from any directory, and the directory
+you are standing in is the one mounted at `/workspace`. Copying the file into
+`~/.local/bin` instead would break the `agents/` and `settings.json` mounts.
 
 ### Mounts
 
@@ -59,9 +73,9 @@ The first build takes roughly 5–10 minutes, because `pyenv install` compiles C
 
 The repo's `agents/` and `settings.json` are nested mounts placed **on top of**
 the host's `~/.claude`, so inside the container they shadow the host's copies. To turn that off:
-`./run.sh --no-agents-mount` / `--no-settings-mount`.
+`./run-claude.sh --no-agents-mount` / `--no-settings-mount`.
 
-### `run.sh` options (before the claude arguments)
+### `run-claude.sh` options (before the claude arguments)
 
 ```
 --image <tag>        default: claude-tools:latest  (or $CLAUDE_TOOLS_IMAGE)
@@ -86,7 +100,7 @@ bubblewrap for filesystem isolation plus socat for the network filter, so both
 packages are installed in the image.
 
 Running bubblewrap *inside* Docker also needs three of Docker's own restrictions
-lifted, which `run.sh` passes by default:
+lifted, which `run-claude.sh` passes by default:
 
 | Option | Without it |
 |---|---|
@@ -99,7 +113,7 @@ difference, so neither is used.
 
 The trade-off is worth stating plainly: these options weaken Docker's own
 confinement of the container in exchange for Claude's sandbox working inside it.
-If you would rather keep Docker's defaults, run `./run.sh --no-sandbox` and set
+If you would rather keep Docker's defaults, run `./run-claude.sh --no-sandbox` and set
 `"sandbox": {"enabled": false}` in `settings.json` — otherwise Claude will report
 that the sandbox is enabled but cannot start.
 
@@ -115,13 +129,13 @@ only for paths you mount yourself with `--mount`, using the container-side path.
   `/etc/sudoers`. Anything requiring root has to go into the `Dockerfile`.
 - `settings.json` uses `defaultMode: "default"`. For a looser flow inside the container, change it to `"acceptEdits"` or
   run
-  `./run.sh --dangerously-skip-permissions`.
+  `./run-claude.sh --dangerously-skip-permissions`.
 - `~/.ssh` is mounted read-only and is on the `deny` list in `settings.json`.
 
 ## Tooling inside the container
 
 ```bash
-./run.sh shell -lc 'node -v; npm -v; python -V; pyenv versions; java -version; sdk version'
+./run-claude.sh shell -lc 'node -v; npm -v; python -V; pyenv versions; java -version; sdk version'
 ```
 
 - **npm/node** — Node 22 (NodeSource), global prefix `~/.npm-global`
