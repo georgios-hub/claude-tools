@@ -130,6 +130,9 @@ Write only what was discussed and what you verified in the code. If you catch yo
 to because it seems obviously right, stop — either raise it, or put it in Open questions. Invented decisions are the one
 way this document becomes worse than nothing.
 
+Keep the Markdown formating to 120 chars per line and keep the tables fully oriented, like in the Markdown example
+below.
+
 ```markdown
 # <Title>
 
@@ -162,8 +165,8 @@ migrations. Configuration. Omit what does not apply.
 ## 6. Failure handling and edge cases
 
 | Condition | Behaviour | User-visible result |
-|---|---|---|
-| … | … | … |
+|-----------|-----------|---------------------|
+| …         | …         | …                   |
 
 ## 7. Alternatives considered
 
@@ -177,10 +180,10 @@ What could go wrong, backward-compatibility impact, performance and security con
 
 ## 9. Implementation algorithm
 
-| # | Step | Files / area | Commit title | Depends on | Done when |
-|---|---|---|---|---|---|
-| S1 | … | … | `…` | — | … |
-| S2 | … | … | `…` | S1 | … |
+| #  | Step | Files / area | Commit title | Depends on | Done when |
+|----|------|--------------|--------------|------------|-----------|
+| S1 | …    | …            | `…`          | —          | …         |
+| S2 | …    | …            | `…`          | S1         | …         |
 
 **Parallelization:** Wave 1: S1, S2 · Wave 2: S3 (needs S1) …
 

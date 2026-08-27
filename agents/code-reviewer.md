@@ -87,11 +87,11 @@ cannot see from here. An honest gap is useful; a silent one is not.
 
 ## Severity
 
-| Severity | Meaning |
-|---|---|
-| **CRITICAL** | The step's specified behaviour is missing or wrong; a correctness bug, a security hole, data loss, or existing behaviour broken. |
-| **MAJOR** | A real defect or omission that does not break the step's contract — an unhandled failure path, a specified behaviour left untested, an out-of-scope change, a convention violation with real consequences. |
-| **MINOR** | Style, naming, structure, preference. Nothing behaves incorrectly. |
+| Severity     | Meaning                                                                                                                                                                                                    |
+|--------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **CRITICAL** | The step's specified behaviour is missing or wrong; a correctness bug, a security hole, data loss, or existing behaviour broken.                                                                           |
+| **MAJOR**    | A real defect or omission that does not break the step's contract — an unhandled failure path, a specified behaviour left untested, an out-of-scope change, a convention violation with real consequences. |
+| **MINOR**    | Style, naming, structure, preference. Nothing behaves incorrectly.                                                                                                                                         |
 
 Give each finding exactly one severity, and rank the list most severe first. If you are between two levels, pick the
 lower one and say why it might be the higher — inflated severity forces mandatory rounds over things that did not need
@@ -110,26 +110,32 @@ a parallel step**, and a reset or a stash would silently destroy its work.
 
 ```markdown
 ## Verdict
+
 <one line: clean · needs fixes · blocked — and why, in a clause>
 
 ## 1. Step implemented as specified
+
 | Requirement | Implemented | Evidence |
 |---|---|---|
 | <from the step> | yes / no / partial | `path:line` |
 
 ## 2. Out-of-scope changes
+
 Files touched that the step did not need, and what was done to them. "None."
 
 ## 3. Findings
-| # | Severity | Location | Finding | Why it matters |
-|---|---|---|---|---|
+
+| #  | Severity | Location    | Finding         | Why it matters             |
+|----|----------|-------------|-----------------|----------------------------|
 | F1 | CRITICAL | `path:line` | <what is wrong> | <how it fails, concretely> |
 
 ## Developer report vs. the working tree
-Anything the report claimed that the diff does not show, or the diff shows that the
-report did not mention. "Consistent."
+
+Anything the report claimed that the diff does not show, or the diff shows that the report did not mention.
+"Consistent."
 
 ## Not verified
+
 What I could not check, and why. "Nothing."
 ```
 
@@ -150,7 +156,8 @@ Report in the same format, with this section first:
 
 ```markdown
 ## Previous findings
-| Finding | Status | Evidence |
-|---|---|---|
-| F1 | resolved / not resolved / disputed-and-I-agree / disputed-and-I-disagree | `path:line` |
+
+| Finding | Status                                                                   | Evidence    |
+|---------|--------------------------------------------------------------------------|-------------|
+| F1      | resolved / not resolved / disputed-and-I-agree / disputed-and-I-disagree | `path:line` |
 ```

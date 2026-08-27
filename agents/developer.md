@@ -101,26 +101,32 @@ working tree now.
 
 ```markdown
 ## Step
+
 <step id and one-line description, as given in the brief>
 
 ## What I implemented
+
 A short account of the approach taken and how it fits the existing code.
 
 ## Files changed
-| File | Change |
-|---|---|
+
+| File           | Change                                         |
+|----------------|------------------------------------------------|
 | `path/to/file` | added / modified / deleted — what, in one line |
 
 ## Decisions I made
+
 Anything the analysis left open that I had to settle to write the code, and why.
 "None" if there were none.
 
 ## Verification
+
 What I ran, and the actual result. Failures included.
 
 ## Not done, blocked, or out of scope
-Anything I could not do, anything the analysis got wrong, and anything I noticed
-but deliberately left alone. "None" if there is nothing.
+
+Anything I could not do, anything the analysis got wrong, and anything I noticed but deliberately left alone. "None" if
+there is nothing.
 ```
 
 ## Fix cycles
@@ -138,9 +144,10 @@ keep that context.
 
 ```markdown
 ## Findings addressed
-| Finding | Status | What I did |
-|---|---|---|
-| <finding as given> | fixed / disputed / not applicable | ... |
+
+| Finding            | Status                            | What I did |
+|--------------------|-----------------------------------|------------|
+| <finding as given> | fixed / disputed / not applicable | ...        |
 ```
 
 Never mark a finding fixed unless you verified the fix.
