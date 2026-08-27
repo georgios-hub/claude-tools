@@ -11,6 +11,13 @@
 #   ./build.sh --python none --java none        # skip the slow installations
 #   ./build.sh --claude-version 2.1.246
 #   ./build.sh --maven 3.9.9 --gradle 8.10.2
+#   ./build.sh --engine podman         # build with podman instead of docker
+#
+# The engine defaults to docker when it is installed and podman otherwise; it
+# can also be pinned with CONTAINER_ENGINE=podman. The Dockerfile itself is
+# engine-agnostic: it uses no BuildKit-only features, and every apt-get runs
+# before the USER instruction, so a rootless `podman build` has root inside its
+# own user namespace exactly where the build needs it.
 
 set -euo pipefail
 
@@ -20,6 +27,8 @@ IMAGE_TAG="${CLAUDE_TOOLS_IMAGE:-claude-tools:latest}"
 USER_NAME="${CLAUDE_TOOLS_USER:-claude}"
 USER_UID="$(id -u)"
 USER_GID="$(id -g)"
+
+ENGINE="${CONTAINER_ENGINE:-}"
 
 NODE_MAJOR=22
 CLAUDE_VERSION=latest
@@ -39,6 +48,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tag)            IMAGE_TAG="$2"; shift 2 ;;
+        --engine)            ENGINE="$2"; shift 2 ;;
         -u|--user)           USER_NAME="$2"; shift 2 ;;
         --uid)               USER_UID="$2"; shift 2 ;;
         --gid)               USER_GID="$2"; shift 2 ;;
@@ -53,14 +63,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ -z "$ENGINE" ]; then
+    if command -v docker >/dev/null 2>&1; then ENGINE=docker; else ENGINE=podman; fi
+fi
+command -v "$ENGINE" >/dev/null 2>&1 \
+    || { echo "error: '${ENGINE}' is not on PATH" >&2; exit 1; }
+
 echo "==> Building ${IMAGE_TAG}"
+echo "    engine : ${ENGINE}"
 echo "    user   : ${USER_NAME} (uid=${USER_UID} gid=${USER_GID}, no sudo)"
 echo "    node   : ${NODE_MAJOR}   claude: ${CLAUDE_VERSION}"
 echo "    python : ${PYTHON_VERSION}   java: ${JAVA_VERSION}"
 echo "    maven  : ${MAVEN_VERSION}   gradle: ${GRADLE_VERSION}"
 echo
 
-docker build \
+"${ENGINE}" build \
     --build-arg "USER_NAME=${USER_NAME}" \
     --build-arg "USER_UID=${USER_UID}" \
     --build-arg "USER_GID=${USER_GID}" \
@@ -76,4 +93,11 @@ docker build \
 
 echo
 echo "==> Done: ${IMAGE_TAG}"
-echo "    Run it with: ${SCRIPT_DIR}/run-claude.sh [claude args...]"
+
+# run-claude.sh auto-detects the same way, so the engine only has to be named
+# again when this build did not use the one it would pick on its own.
+RUN_PREFIX=""
+if [ "$ENGINE" != "docker" ] && command -v docker >/dev/null 2>&1; then
+    RUN_PREFIX="CONTAINER_ENGINE=${ENGINE} "
+fi
+echo "    Run it with: ${RUN_PREFIX}${SCRIPT_DIR}/run-claude.sh [claude args...]"
