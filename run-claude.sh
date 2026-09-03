@@ -18,7 +18,7 @@
 #
 # Options handled by this script (they must come BEFORE the claude arguments):
 #   --image <tag>        image to run (default: claude-tools:latest)
-#   --engine <name>      docker or podman (default: docker if installed)
+#   --engine <name>      podman or docker (default: podman if installed)
 #   --workdir <path>     what to mount as /workspace (default: $PWD)
 #   --mount <src:dst>    additional bind mount (repeatable)
 #   --env  <K=V>         additional environment variable (repeatable)
@@ -30,7 +30,7 @@
 #   --name <name>        container name
 #   --                   end of this script's options
 #
-# The engine can also be pinned with CONTAINER_ENGINE=podman. Both engines take
+# The engine can also be pinned with CONTAINER_ENGINE=docker. Both engines take
 # the same arguments here except for the user namespace, the /proc unmasking and
 # the default network -- see the comments on each below.
 
@@ -79,9 +79,16 @@ done
 WORKDIR_HOST="$(cd -- "$WORKDIR_HOST" && pwd)"
 
 # --- container engine -------------------------------------------------------
-# Default to docker when it is installed, so existing setups are unaffected.
+# podman is the default; docker is only looked for when podman is not installed.
 if [ -z "$ENGINE" ]; then
-    if command -v docker >/dev/null 2>&1; then ENGINE=docker; else ENGINE=podman; fi
+    if command -v podman >/dev/null 2>&1; then
+        ENGINE=podman
+    elif command -v docker >/dev/null 2>&1; then
+        ENGINE=docker
+    else
+        echo "error: neither podman nor docker is on PATH" >&2
+        exit 1
+    fi
 fi
 command -v "$ENGINE" >/dev/null 2>&1 \
     || { echo "error: '${ENGINE}' is not on PATH" >&2; exit 1; }

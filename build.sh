@@ -11,10 +11,10 @@
 #   ./build.sh --python none --java none        # skip the slow installations
 #   ./build.sh --claude-version 2.1.246
 #   ./build.sh --maven 3.9.9 --gradle 8.10.2
-#   ./build.sh --engine podman         # build with podman instead of docker
+#   ./build.sh --engine docker         # build with docker instead of podman
 #
-# The engine defaults to docker when it is installed and podman otherwise; it
-# can also be pinned with CONTAINER_ENGINE=podman. The Dockerfile itself is
+# The engine defaults to podman when it is installed and docker otherwise; it
+# can also be pinned with CONTAINER_ENGINE=docker. The Dockerfile itself is
 # engine-agnostic: it uses no BuildKit-only features, and every apt-get runs
 # before the USER instruction, so a rootless `podman build` has root inside its
 # own user namespace exactly where the build needs it.
@@ -63,8 +63,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# podman is the default; docker is only looked for when podman is not installed.
+AUTO_ENGINE=""
+if command -v podman >/dev/null 2>&1; then
+    AUTO_ENGINE=podman
+elif command -v docker >/dev/null 2>&1; then
+    AUTO_ENGINE=docker
+fi
 if [ -z "$ENGINE" ]; then
-    if command -v docker >/dev/null 2>&1; then ENGINE=docker; else ENGINE=podman; fi
+    [ -n "$AUTO_ENGINE" ] \
+        || { echo "error: neither podman nor docker is on PATH" >&2; exit 1; }
+    ENGINE="$AUTO_ENGINE"
 fi
 command -v "$ENGINE" >/dev/null 2>&1 \
     || { echo "error: '${ENGINE}' is not on PATH" >&2; exit 1; }
@@ -97,7 +106,7 @@ echo "==> Done: ${IMAGE_TAG}"
 # run-claude.sh auto-detects the same way, so the engine only has to be named
 # again when this build did not use the one it would pick on its own.
 RUN_PREFIX=""
-if [ "$ENGINE" != "docker" ] && command -v docker >/dev/null 2>&1; then
+if [ "$ENGINE" != "$AUTO_ENGINE" ]; then
     RUN_PREFIX="CONTAINER_ENGINE=${ENGINE} "
 fi
 echo "    Run it with: ${RUN_PREFIX}${SCRIPT_DIR}/run-claude.sh [claude args...]"
