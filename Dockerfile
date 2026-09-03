@@ -10,7 +10,7 @@
 #   ./build.sh                (picks up the current user's uid/gid automatically)
 #   docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -t claude-tools .
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG USER_NAME=claude
 ARG USER_UID=1000
@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         bash zip unzip xz-utils \
         build-essential pkg-config \
         libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
-        libncursesw5-dev tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
+        libncurses-dev tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
         procps less vim-tiny nano jq ripgrep fd-find locales tzdata \
         bubblewrap socat \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
