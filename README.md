@@ -69,7 +69,7 @@ you are standing in is the one mounted at `/workspace`. Copying the file into
 | `~/.claude.json`                    | `~/.claude.json`                                             |
 | `<repo>/agents`                     | `~/.claude/agents` (read-write, layered on top of the above) |
 | `<repo>/settings.json`              | `~/.claude/settings.json` (read-write)                       |
-| `~/.gitconfig`, `~/.ssh`            | same paths, **read-only** (when present)                     |
+| `~/.gitconfig`                      | same path, **read-only** (when present)                      |
 
 The repo's `agents/` and `settings.json` are nested mounts placed **on top of**
 the host's `~/.claude`, so inside the container they shadow the host's copies. To turn that off:
@@ -130,7 +130,8 @@ only for paths you mount yourself with `--mount`, using the container-side path.
 - `settings.json` uses `defaultMode: "default"`. For a looser flow inside the container, change it to `"acceptEdits"` or
   run
   `./run-claude.sh --dangerously-skip-permissions`.
-- `~/.ssh` is mounted read-only and is on the `deny` list in `settings.json`.
+- `~/.ssh` is **not** mounted: a mounted key is readable by anything running in the
+  container. It also stays on the `deny` list in `settings.json`.
 
 ## Tooling inside the container
 

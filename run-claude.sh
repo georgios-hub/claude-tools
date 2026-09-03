@@ -179,10 +179,16 @@ if [ "$MOUNT_SETTINGS" -eq 1 ] && [ -f "$SCRIPT_DIR/settings.json" ]; then
     ENGINE_ARGS+=(-v "$SCRIPT_DIR/settings.json:$CONTAINER_HOME/.claude/settings.json")
 fi
 
-# Handy read-only mounts, when they exist on the host.
-for ro in "$HOME/.gitconfig" "$HOME/.ssh"; do
-    [ -e "$ro" ] && ENGINE_ARGS+=(-v "$ro:$CONTAINER_HOME/$(basename "$ro"):ro")
-done
+# Handy read-only mount, when it exists on the host.
+#
+# ~/.ssh is deliberately NOT mounted. A mounted key is readable by every process
+# in the container -- `:ro` prevents writes, never reads -- and the deny entries
+# in settings.json only constrain Claude's own tools, not an arbitrary command.
+# Nothing in the image needs the host's keys; give a dedicated key with --mount
+# if a container ever has to reach a remote over ssh.
+if [ -e "$HOME/.gitconfig" ]; then
+    ENGINE_ARGS+=(-v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro")
+fi
 
 for m in "${EXTRA_MOUNTS[@]:-}"; do
     [ -n "$m" ] && ENGINE_ARGS+=(-v "$m")
