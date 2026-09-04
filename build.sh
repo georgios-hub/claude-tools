@@ -11,13 +11,11 @@
 #   ./build.sh --python none --java none        # skip the slow installations
 #   ./build.sh --claude-version 2.1.246
 #   ./build.sh --maven 3.9.9 --gradle 8.10.2
-#   ./build.sh --engine docker         # build with docker instead of podman
 #
-# The engine defaults to podman when it is installed and docker otherwise; it
-# can also be pinned with CONTAINER_ENGINE=docker. The Dockerfile itself is
-# engine-agnostic: it uses no BuildKit-only features, and every apt-get runs
-# before the USER instruction, so a rootless `podman build` has root inside its
-# own user namespace exactly where the build needs it.
+# podman is the only supported engine and has to be on PATH; there is no docker
+# fallback. The Dockerfile uses no BuildKit-only features, and every apt-get
+# runs before the USER instruction, so a rootless `podman build` has root
+# inside its own user namespace exactly where the build needs it.
 
 set -euo pipefail
 
@@ -27,8 +25,6 @@ IMAGE_TAG="${CLAUDE_TOOLS_IMAGE:-claude-tools:latest}"
 USER_NAME="${CLAUDE_TOOLS_USER:-claude}"
 USER_UID="$(id -u)"
 USER_GID="$(id -g)"
-
-ENGINE="${CONTAINER_ENGINE:-}"
 
 NODE_MAJOR=22
 CLAUDE_VERSION=latest
@@ -48,7 +44,6 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tag)            IMAGE_TAG="$2"; shift 2 ;;
-        --engine)            ENGINE="$2"; shift 2 ;;
         -u|--user)           USER_NAME="$2"; shift 2 ;;
         --uid)               USER_UID="$2"; shift 2 ;;
         --gid)               USER_GID="$2"; shift 2 ;;
@@ -63,23 +58,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# podman is the default; docker is only looked for when podman is not installed.
-AUTO_ENGINE=""
-if command -v podman >/dev/null 2>&1; then
-    AUTO_ENGINE=podman
-elif command -v docker >/dev/null 2>&1; then
-    AUTO_ENGINE=docker
-fi
-if [ -z "$ENGINE" ]; then
-    [ -n "$AUTO_ENGINE" ] \
-        || { echo "error: neither podman nor docker is on PATH" >&2; exit 1; }
-    ENGINE="$AUTO_ENGINE"
-fi
-command -v "$ENGINE" >/dev/null 2>&1 \
-    || { echo "error: '${ENGINE}' is not on PATH" >&2; exit 1; }
+# podman is the only engine this image is built and run with: a docker-built
+# image lands in docker's store, which a podman-only run-claude.sh never reads.
+command -v podman >/dev/null 2>&1 \
+    || { echo "error: podman is not on PATH" >&2; exit 1; }
 
 echo "==> Building ${IMAGE_TAG}"
-echo "    engine : ${ENGINE}"
 echo "    user   : ${USER_NAME} (uid=${USER_UID} gid=${USER_GID}, no sudo)"
 echo "    node   : ${NODE_MAJOR}   claude: ${CLAUDE_VERSION}"
 echo "    python : ${PYTHON_VERSION}   java: ${JAVA_VERSION}"
@@ -91,11 +75,8 @@ echo
 # format instruction: podman builds OCI by default, silently ignores it, and falls
 # back to /bin/sh -- where `set -o pipefail` and `source` do not exist and the
 # SDKMAN! step fails. Asking podman for the docker format keeps SHELL effective.
-FORMAT_ARGS=()
-[ "$(basename -- "$ENGINE")" = "podman" ] && FORMAT_ARGS+=(--format docker)
-
-"${ENGINE}" build \
-    "${FORMAT_ARGS[@]}" \
+podman build \
+    --format docker \
     --build-arg "USER_NAME=${USER_NAME}" \
     --build-arg "USER_UID=${USER_UID}" \
     --build-arg "USER_GID=${USER_GID}" \
@@ -111,11 +92,4 @@ FORMAT_ARGS=()
 
 echo
 echo "==> Done: ${IMAGE_TAG}"
-
-# run-claude.sh auto-detects the same way, so the engine only has to be named
-# again when this build did not use the one it would pick on its own.
-RUN_PREFIX=""
-if [ "$ENGINE" != "$AUTO_ENGINE" ]; then
-    RUN_PREFIX="CONTAINER_ENGINE=${ENGINE} "
-fi
-echo "    Run it with: ${RUN_PREFIX}${SCRIPT_DIR}/run-claude.sh [claude args...]"
+echo "    Run it with: ${SCRIPT_DIR}/run-claude.sh [claude args...]"
