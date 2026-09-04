@@ -57,6 +57,9 @@ it: *"Anything requiring root has to go into the `Dockerfile`."*
 **The entrypoint** (`docker-entrypoint.sh`) initialises pyenv and SDKMAN!, offers a `shell`/`bash`/`sh` escape hatch,
 and ends in `exec claude "$@"`. It starts no background processes.
 
+**Build format.** Commit `4e35c5a` makes `build.sh` pass `--format docker` when the engine is podman, because podman
+ignores the `SHELL` instruction in OCI format and the `Dockerfile` relies on it for the SDKMAN! step. See §5.2b.
+
 **Engine selection** is duplicated in `build.sh` and `run-claude.sh`: podman if present, else docker, else error and
 exit non-zero (commit `6a01eb2`). `build.sh` additionally tracks `AUTO_ENGINE` purely so it can tell the user whether
 `run-claude.sh` will need `CONTAINER_ENGINE=` repeated.
@@ -119,16 +122,18 @@ Three properties follow from that shape, and together they are the whole argumen
 - **Relative volumes resolve correctly.** A compose file's `./config:/etc/app` resolves against its own directory under
   `/workspace`, which exists in the same namespace.
 
-**Why the daemon must be started by the entrypoint rather than invoked by the agent.** Claude's sandbox runs bubblewrap
-around every Bash call. Bubblewrap sets `PR_SET_NO_NEW_PRIVS` and maps a single uid, which means (a) the setuid-root
-`newuidmap`/`newgidmap` helpers have no effect and (b) no subuid range is available. Rootless podman needs both to
-create its own user namespace, and images that drop privileges to a non-root uid — `postgres` and `rabbitmq` both drop
-to uid 999 — cannot start with a single-id mapping. Starting `podman system service` from `docker-entrypoint.sh`, in the
-PID-1 context before any sandbox exists, moves all of that work outside bubblewrap. What remains inside the sandbox is a
-`connect()` to a unix socket.
+**Why the daemon is started by the entrypoint rather than invoked by the agent.** The reason is the API, not the
+sandbox: Testcontainers, dockerode, docker-py and the compose implementations all speak the Docker-compatible **socket**
+and never the CLI, so a service has to exist regardless. Starting `podman system service` from `docker-entrypoint.sh`,
+in the PID-1 context, is simply the earliest and simplest place to put it.
 
-**This assumption is not verified.** See §5.6 for the confirming command, and S1 in §9, which is a spike that must run
-before anything is built on top of it.
+An earlier draft justified it differently — that bubblewrap's `no_new_privs` neutralises the setuid-root
+`newuidmap`/`newgidmap` helpers. **The spike refuted that diagnosis** (§5.6): `newuidmap` fails for a capability reason
+that applies outside bubblewrap too, and is fixed on the outer container rather than inside. Whether bubblewrap
+*additionally* blocks the local CLI is still unmeasured and does not affect the case for the service.
+
+**The core of this design is now verified.** The S1 spike brought up `postgres:16` nested, watched it drop to uid 999
+and report itself ready, and reached its published port from inside the claude container. See §5.10.
 
 **The agent's interface is `podman`.** `CONTAINER_HOST` points the podman CLI at the service, so `podman run …` works
 as a thin remote client. `DOCKER_HOST` is set to the same socket — not as an engine choice, but because Testcontainers,
@@ -165,10 +170,12 @@ the commentary style of sections 1-7 and of the sandbox block in `run-claude.sh`
 
 Also required in the same section:
 
-- `/etc/subuid` and `/etc/subgid` entries for `${USER_NAME}`. **The ranges cannot be chosen from a desk.** Under
-  `--userns=keep-id` the outer container maps a limited id space, and any subuid range outside that mapping makes
-  `newuidmap` fail. The customary `claude:100000:65536` is very likely wrong here. S1 determines the usable range; the
-  expected shape is one or two ranges lying inside the outer mapping and skipping the build-arg uid itself.
+- `/etc/subuid` and `/etc/subgid` entries for `${USER_NAME}`. **The ranges cannot be chosen from a desk** — they must
+  lie inside the id space `--userns=keep-id` maps into the container, and must skip the build-arg uid itself. The
+  customary `claude:100000:65536` is wrong here. The spike derived them arithmetically from `/proc/self/uid_map`
+  (Appendix A step 3) and confirmed `claude:1002:64535` / `claude:1004:64533` on a host with uid 1001 and gid 1003 and a
+  65536-wide range. The Dockerfile must compute them the same way, not hardcode these values, since they follow from
+  whatever uid and gid the build args carry.
 - `XDG_RUNTIME_DIR`. Rootless podman requires it and the image does not set it. Create `/run/user/${USER_UID}` owned by
   the build-arg uid and export it.
 - `containers.conf` with `cgroup_manager = "cgroupfs"` (there is no systemd in the container) and `events_logger =
@@ -176,8 +183,20 @@ Also required in the same section:
 - `storage.conf` selecting `overlay` with `mount_program = /usr/bin/fuse-overlayfs`, with `vfs` named as the documented
   fallback.
 
-Package names are for Debian 13 and **need confirmation**: `apt-cache policy podman uidmap fuse-overlayfs passt
-slirp4netns catatonit podman-compose` on a trixie host. Expected image growth is roughly 60-150 MB, unverified.
+Package names are **confirmed present in Debian 13**, measured on the user's host on 2026-09-03 with `apt-cache policy`
+inside `debian:trixie-slim`: `podman 5.4.2+ds1-2+b2`, `uidmap 1:4.17.4-2`, `fuse-overlayfs 1.14-1+b1`,
+`passt 0.0~git20250503.587980c-2+deb13u1`, `slirp4netns 1.2.1-1.1`, `catatonit 0.2.1-2+b13`, `podman-compose 1.3.0-1`.
+That open item is closed. The trixie base image measures **1.88 GB**, slightly smaller than the 1.96 GB bookworm one.
+Growth from adding podman and its dependencies was roughly 100 MB, but measured against the bookworm base — treat it as
+indicative and re-measure on trixie.
+
+### 5.2b Build format — a hard prerequisite
+
+Podman **ignores the `SHELL` instruction when building in OCI format**, which breaks the SDKMAN! step in section 6 of
+the `Dockerfile`. Commit `4e35c5a` makes `build.sh` pass `--format docker`. Any repository whose `Dockerfile` uses
+`SHELL` cannot be built by podman in the default format, so this is a prerequisite for everything here rather than a
+detail: without it the image does not build at all under a podman-only design. Validated together with `a3ca3fe` during
+the spike — the Debian 13 image now builds.
 
 ### 5.3 The storage volume is not an optimisation
 
@@ -190,20 +209,37 @@ Proposed mount: `-v claude-tools-containers:/home/<user>/.local/share/containers
 the volume to the container user, is likely needed on first creation under `--userns=keep-id`; **verify** with
 `podman volume inspect` and an `ls -ln` inside the container.
 
+**The cost argument is softer than assumed.** The spike reported `Store.GraphDriverName = overlay`, so `fuse-overlayfs`
+does work with `--device /dev/fuse` and the `vfs` fallback — with its per-layer copies and slow first starts — may never
+be reached. Re-verify before relying on it; the volume is still required, because `fuse-overlayfs` cannot stack on the
+container's own overlayfs.
+
 ### 5.4 `run-claude.sh --containers`
 
 Default **off**. When given, it adds:
 
+- **`--cap-add=all`** — required. See below; this is a genuine new concession.
 - `--device /dev/fuse` — for `fuse-overlayfs`.
 - `--device /dev/net/tun` — for pasta/slirp4netns, which the inner podman uses for its rootless network namespace.
 - the named volume of §5.3.
 - `-e CLAUDE_TOOLS_CONTAINERS=1`, which is what the entrypoint keys off.
 
-Worth stating because it is reassuring rather than alarming: **no additional security option is required.**
-`seccomp=unconfined` and `unmask=ALL` are already passed for Claude's sandbox, and they are the same two relaxations
-nested podman needs. `--containers` adds two device nodes and a volume, nothing else. If `--no-sandbox` is used, those
-two options disappear and `--containers` will not work — the two flags are mutually exclusive in practice and the script
-should say so.
+**`--cap-add=all` is a new security concession and must be described as one.** An earlier draft claimed `--containers`
+needed no new security option because `seccomp=unconfined` and `unmask=ALL` were already passed. The spike refuted
+that: without `--cap-add=all`, `newuidmap` fails and no image that drops privileges can start. The capabilities are
+added to the *outer* container — the one Claude runs in — and they are real capabilities in that user namespace, not on
+the host.
+
+**Narrowing it is unresolved and worth revisiting.** `--cap-add=setuid,setgid` alone changed nothing, even though
+`CAP_SETUID` and `CAP_SETGID` were already present in `CapBnd` before any `--cap-add`. Only the full set worked. Which
+additional capability is operative was **not** determined and is deliberately not guessed here. Moving from `all` to a
+named set would be a measurable improvement to the threat model and is the obvious follow-up.
+
+`--privileged` was also tried and also worked. It is **rejected**: it is strictly broader, additionally exposing host
+devices reachable by the invoking user, and it buys nothing that `--cap-add=all` does not.
+
+If `--no-sandbox` is used, `seccomp=unconfined` and `unmask=ALL` disappear and `--containers` will not work — the two
+flags are mutually exclusive in practice and the script should say so.
 
 ### 5.5 Compose
 
@@ -235,18 +271,28 @@ One consequence cuts the other way and belongs in the threat model: because the 
 pulls are not seen by the sandbox's network filter at all.** The agent can pull any image from any registry the
 container can reach.
 
-**Confirming this is step 6 of the spike procedure in Appendix A**, which compares `podman info` outside bubblewrap
-(via `shell`) with the same command issued through Claude's Bash tool with the sandbox on. Appendix A is written against
-the repository exactly as it stands today, with no `--containers` flag and no podman in the image. Once S5 and S7 have
-landed, the same comparison is expressed as
+**The earlier `no_new_privs` diagnosis was wrong, and is withdrawn.** This document previously argued that bubblewrap
+neutralises the setuid-root `newuidmap`/`newgidmap` helpers, and that this was why the daemon had to live outside the
+sandbox. The spike refuted it directly. In a plain container shell, **with no bubblewrap anywhere in the picture**,
+`newuidmap` still failed, with:
+
+- the setuid bits intact (`-rwsr-xr-x root root`),
+- the rootfs mounted `rw,relatime` — no `nosuid`,
+- `CAP_SETUID` and `CAP_SETGID` already in `CapBnd` (`00000000800405fb`),
+- a subuid range correctly inside the outer mapping.
+
+Nested user namespace creation itself is permitted: `unshare -U -r id -u` printed `0`. The cause is **capabilities on
+the outer container**, and the fix is `--cap-add=all` there (§5.4) — not anything about the sandbox.
+
+**What remains genuinely unmeasured** is whether bubblewrap *also* blocks the local podman CLI once the capability
+problem is solved. That comparison — Appendix A step 7 — has not been run. It no longer decides whether the service
+exists, since §4 justifies that on the API, but it does decide whether the agent can usefully run `podman` locally as
+well as remotely. Once S5 and S7 have landed it is expressed as
 
 ```
-./run-claude.sh --containers shell -lc 'podman info'          # outside bwrap — expected to succeed
+./run-claude.sh --containers shell -lc 'podman info'          # outside bwrap
 ./run-claude.sh --containers -p 'run: podman info'            # via the Bash tool, sandbox on
 ```
-
-If the sandboxed case succeeds with the CLI operating locally rather than remotely, the `no_new_privs` assumption is
-wrong and the design simplifies. If it fails, the socket is the reason the service exists.
 
 ### 5.7 Environment exported into the container
 
@@ -314,6 +360,39 @@ run non-root containers against named volumes.**
 host uid 0, and a spawned container can then write root-owned files onto the host through any bind mount. That is why
 `run-claude.sh` refuses to start under `sudo podman` — see §10 and S3.
 
+### 5.10 What the S1 spike established
+
+Run on the user's host on 2026-09-03. Everything here was **observed**, not predicted.
+
+Environment: host uid 1001, gid 1003; `/etc/subuid` and `/etc/subgid` both `gsiggouroglou:165536:65536`; podman 5.4.2;
+kernel `7.1.8+deb13-amd64`; `/proc/sys/user/max_user_namespaces` = 2147483647.
+
+Inside the outer container under `--userns=keep-id`, with `--cap-add=all --device /dev/fuse --device /dev/net/tun`
+added to the flags `run-claude.sh` already passes:
+
+| Observation                     | Value                                                                              |
+|---------------------------------|------------------------------------------------------------------------------------|
+| `uid_map`                       | `0→1 (1001)`, `1001→0 (1)`, `1002→1002 (64535)`                                     |
+| `gid_map`                       | `0→1 (1003)`, `1003→0 (1)`, `1004→1004 (64533)`                                     |
+| derived ranges                  | `claude:1002:64535` / `claude:1004:64533`                                           |
+| `newuidmap` / `newgidmap`       | `-rwsr-xr-x root root` — setuid bits intact                                          |
+| rootfs mount options            | `rw,relatime` — no `nosuid`                                                          |
+| `CapBnd` before any `--cap-add` | `00000000800405fb`, already including `CAP_SETUID` and `CAP_SETGID`                  |
+| nested userns creation          | permitted — `unshare -U -r id -u` printed `0`                                        |
+| storage driver                  | `overlay`                                                                            |
+| `postgres:16` nested            | started, dropped to uid 999, logged *"database system is ready"*                     |
+| published port 15432            | reachable from inside the claude container                                           |
+
+**The core of route A is verified.** A stock image that drops privileges runs nested, and its published port is
+reachable from the test process — which is exactly §5.9's claim that `localhost` means the same thing on both sides.
+
+**`--userns=keep-id` is exonerated.** The pre-capability failure was byte-identical with and without it. It stays, since
+it is what preserves sane file ownership, and it costs nothing here.
+
+**Still unmeasured, and deliberately not inferred from the above:** the §5.9 ownership experiment (root versus uid-999
+writes into the `/workspace` bind mount, read back with `ls -ln` from the host); the bubblewrap comparison of §5.6; the
+Ryuk variable of §5.7; and MinIO's default user.
+
 ## 6. Failure handling and edge cases
 
 | Condition                                                    | Behaviour                                              | User-visible result                                              |
@@ -366,13 +445,20 @@ wrong for this use case.
 
 ## 8. Risks and impact
 
-**The design may not work at all on the target host.** Nested user namespaces under `--userns=keep-id` are the single
-unverified load-bearing assumption. This is why S1 is a spike and not the last step. If it fails, the honest outcome is
-to keep the podman-only wave and abandon the rest.
+**The load-bearing assumption is now verified.** The S1 spike brought up a stock `postgres:16` nested under
+`--userns=keep-id` and reached its published port from inside the claude container (§5.10). The risk that the whole
+approach is impossible on this host is closed.
 
 **Security promises that stop being true.** The user has accepted these knowingly; they are recorded so the acceptance
 is on the record.
 
+- **The container now runs with `--cap-add=all`.** This is the most significant new concession and it was not
+  anticipated: the design was drafted believing `--containers` needed no security option beyond those already passed
+  for Claude's sandbox, and the spike refuted that. The capabilities apply inside the container's user namespace, not
+  on the host, so they do not confer host privilege — but the outer container is materially less confined than before,
+  and `run-claude.sh` grants this only under `--containers`. `--privileged` was rejected as strictly broader.
+  Which single capability is actually required is **unknown**; narrowing `all` to a named set is the clearest available
+  improvement to this threat model and should be treated as a follow-up rather than forgotten.
 - The README's *"Anything requiring root has to go into the `Dockerfile`"* survives literally — there is still no `sudo`
   — but the image gains `newuidmap`/`newgidmap`, setuid-root helpers whose whole purpose is to cross a privilege
   boundary, and the agent gains root inside nested user namespaces. Not host root; not the same claim either.
@@ -399,7 +485,8 @@ That is the practical cost of this design and belongs in the README.
 `--engine docker`; they must install podman and rebuild, since a docker-built image is not in podman's store. The README
 must say so. `--containers` defaults to off, so existing invocations are otherwise unaffected.
 
-**Operational cost.** Image growth of roughly 60-150 MB (unverified). A named volume that grows with every image the
+**Operational cost.** Image growth of roughly 100 MB — measured once, but against a bookworm base, so indicative only
+and pending re-measurement on trixie. A named volume that grows with every image the
 agent pulls and is never reclaimed automatically. First-run latency dominated by pulls. No cgroup delegation inside the
 container, so spawned containers run without resource limits — a runaway test fixture is bounded only by the claude
 container's own limits.
@@ -411,35 +498,38 @@ which is a real weakness; §5.6 and the spike exist to make it repeatable rather
 
 | #   | Step                                        | Files / area                          | Commit title                                      | Depends on     | Done when                                                                 |
 |-----|---------------------------------------------|---------------------------------------|---------------------------------------------------|----------------|---------------------------------------------------------------------------|
-| S1  | Spike nested podman on a real host           | this document                          | `Record the nested podman spike results`           | —              | usable subuid ranges and the sandbox verdict are written into §5.2/§5.6    |
+| S1  | Spike nested podman on a real host **(done)**| this document                          | `Record the nested podman spike results`           | —              | done — results in §5.10; nesting verified, `--cap-add=all` found necessary |
 | S2  | Drop docker from the build script            | `build.sh`                             | `Remove the docker engine option from build.sh`    | —              | `--engine`/`CONTAINER_ENGINE`/`AUTO_ENGINE` gone; missing podman errors    |
 | S3  | Drop docker, require rootless podman         | `run-claude.sh`                        | `Remove the docker engine option from run-claude.sh`| —             | engine branches gone; `unmask=ALL` unconditional; rootful refused          |
 | S4  | Document the podman-only engine              | `README.md`                            | `Document the podman-only engine in the README`    | S2, S3         | sandbox table rewritten for podman; migration note for docker users        |
 | S5  | Install podman and its config in the image   | `Dockerfile`                           | `Install rootless podman in the image`             | S1             | image builds; `podman info` succeeds in `shell`; options commented in file |
 | S6  | Start the API service from the entrypoint    | `docker-entrypoint.sh`                 | `Start the podman API service from the entrypoint` | S5             | socket exists; `podman --remote info` succeeds; failure logs a diagnostic  |
-| S7  | Add the opt-in flag                          | `run-claude.sh`                        | `Add --containers to run-claude.sh`                | S5             | flag adds devices, volume and env; conflicts with `--no-sandbox` rejected  |
+| S7  | Add the opt-in flag                          | `run-claude.sh`                        | `Add --containers to run-claude.sh`                | S5             | flag adds `--cap-add=all`, both devices, volume, env; `--no-sandbox` refused|
 | S8  | Add compose support                          | `Dockerfile`                           | `Add compose support inside the image`             | S5             | a compose file under `/workspace` comes up and down from `shell`           |
 | S9  | Open the socket and loopback to the sandbox  | `settings.json`                        | `Allow the podman socket through Claude's sandbox` | S6, S7         | a Testcontainers run started by the agent reaches the service and the port |
-| S10 | Document the capability and its threat model | `README.md`                            | `Document container spawning and its threat model` | S6, S7, S8, S9 | promises in §8 listed; triage note present; volume cleanup documented      |
+| S10 | Document the capability and its threat model | `README.md`                            | `Document container spawning and its threat model` | S6, S7, S8, S9 | `--cap-add=all` concession stated; triage note; volume cleanup documented  |
 | S11 | Teach the three agents the capability        | `agents/` — three prompts              | `Teach the agents to use podman`                   | S6, S7         | three prompts updated; guidance tailored per role; README note added       |
 | S12 | Version bump                                 | `Version.txt`                          | `v1.2.0`                                           | S10, S11       | version reflects the released change                                       |
 
-**Parallelization:** Wave 1: S1, S2, S3 (independent) · Wave 2: S4 (needs S2, S3), S5 (needs S1) · Wave 3: S6, S7, S8
+**Parallelization:** Wave 1: S1 *(done)*, S2, S3 · Wave 2: S4 (needs S2, S3), S5 (needs S1) · Wave 3: S6, S7, S8
 (need S5) · Wave 4: S9 (needs S6, S7) · Wave 5: S10, S11 (independent of each other) · Wave 6: S12
 
-The podman-only chain (S2 → S3 → S4) and the spawning chain (S1 → S5 → …) are deliberately independent. If S1 comes back
-negative, S2-S4 still land and the rest is abandoned without leaving the repository half-changed.
+With S1 landed, the two chains can now run fully in parallel: the podman-only chain (S2 → S3 → S4) and the spawning
+chain (S5 → S6/S7/S8 → …) share no files and no ordering.
 
 **Step detail**
 
 - **S1** is manual and time-boxed at roughly 45 minutes, most of it image builds. The executable procedure is
   **Appendix A**; it runs against the repository exactly as it stands, with no `--containers` flag and no podman in the
   image. The commit records the observed answers in §5.2, §5.6, §5.7, §5.9 and §10. Nothing else may start until it
-  lands, and one reading in Appendix A step 4 decides whether S5 onward happens at all.
+  lands, and one reading in Appendix A step 5 decides whether S5 onward happens at all.
 - **S3** also removes the `ROOTLESS_PODMAN` distinction outright: the script now errors when `id -u` is 0, so the
   rootful branches for apparmor and the default network have nothing left to guard.
 - **S5** carries the commentary requirement: each package and each config choice documented in the `Dockerfile`, in the
-  style of its existing numbered sections.
+  style of its existing numbered sections. The `/etc/subuid` and `/etc/subgid` entries must be **computed** from the
+  build-arg uid and gid, following the arithmetic in Appendix A step 3 — not hardcoded to the values §5.2 records.
+- **S7** must add `--cap-add=all` alongside the two devices. This is a security concession, so the flag's help text and
+  the comment beside it say what it buys and what it costs, in the manner of the existing sandbox block.
 - **S9** may turn out to need nothing if the sandbox already permits both; the step then records that, and is still a
   commit only if something changes.
 - **S11** touches `agents/code-reviewer.md`, `agents/developer.md` and `agents/senior-dev.md`. The **shared substance**
@@ -468,12 +558,17 @@ negative, S2-S4 still land and the rest is abandoned without leaving the reposit
 
 | # | Question                                                                                      | Who answers | Blocks |
 |---|-----------------------------------------------------------------------------------------------|-------------|--------|
-| 1 | Does `sandbox.filesystem` support a write allowance for the socket path in the installed build?  | S1 spike    | S9     |
-| 2 | `TESTCONTAINERS_RYUK_DISABLED` or `TESTCONTAINERS_RYUK_PRIVILEGED` under nested rootless podman?  | S1 spike    | S9     |
-| 3 | Does the MinIO image in use still default to root? `podman image inspect --format '{{.Config.User}}'` | S1 spike | S11 |
+| 1 | Which capability does `--cap-add=all` actually supply? `setuid,setgid` alone was not enough      | measurement | none   |
+| 2 | Does bubblewrap block the local podman CLI once capabilities are right? (Appendix A step 7)      | measurement | none   |
+| 3 | Does `sandbox.filesystem` support a write allowance for the socket path in the installed build?  | measurement | S9     |
+| 4 | `TESTCONTAINERS_RYUK_DISABLED` or `TESTCONTAINERS_RYUK_PRIVILEGED` under nested rootless podman?  | measurement | S9     |
+| 5 | Does the MinIO image in use still default to root? `podman image inspect --format '{{.Config.User}}'` | measurement | S11 |
+| 6 | The §5.9 ownership experiment — root versus uid-999 writes, read back with `ls -ln` on the host  | measurement | none   |
 
-Both remaining decisions have been taken; what is left are facts the spike will surface. Nothing here blocks S1
-through S8.
+All decisions have been taken; what remains are measurements. **Question 1 is the one worth chasing**: narrowing
+`--cap-add=all` to a named set is the clearest available improvement to the threat model, and it is not on the critical
+path. Question 6 would confirm or refute the table in §5.9, which currently rests on reasoning rather than observation.
+Nothing here blocks S2 through S8.
 
 **Resolved during review, recorded for traceability:**
 
@@ -487,198 +582,227 @@ through S8.
 - **`podman-docker` will not be installed.** The agent is told only podman exists and runs the repository's compose file
   itself, so the shim buys nothing; it would only matter for a repository whose own script shells out to `docker`.
   Folded into S8.
+- The **first spike run (2026-09-03) was void** — three defects in Appendix A, since fixed. A corrected run the same
+  day **succeeded**: nested rootless podman works, `postgres:16` starts and its published port is reachable, and
+  `--cap-add=all` is required. Full record in §5.10.
+- The Debian 13 package versions and `max_user_namespaces` are confirmed; the image builds on trixie after `4e35c5a`.
 - The `~/.ssh` mount has been **removed** in commit `1eabbb5`, in a separate change while this analysis was being
   written. `~/.gitconfig` remains mounted read-only by the user's choice. Nothing in this plan depends on either.
 
 ## Appendix A — Spike procedure (S1)
 
-Runs against the repository **as it stands today**: the current `Dockerfile`, and `run-claude.sh` with no `--containers`
-flag. Because that script has no `--device` passthrough, the spike does not go through it — step 4 uses a raw
-`podman run` mirroring what the script actually passes, plus the two device nodes and a scratch volume.
+**Status: run, and successful.** The results are in §5.10. This procedure is kept for two reasons: steps 6 to 8 were
+never reached and remain the outstanding measurements of §10, and steps 1 to 5 are the reproduction anyone needs when
+S5 and S7 are implemented.
 
-**Nothing below has been executed.** Every "expected" is a prediction to be confirmed or refuted, not an observation.
-Record what actually happens; a refuted prediction is a successful spike.
+Two hard-won lessons are baked into the form below, and both cost a wasted run:
 
-Set once, and reuse. Run from the `claude-tools` checkout:
+- **Never paste a long multi-flag `podman run` into a terminal.** Two commands were mangled that way — one lost `$mode`
+  inside a loop, another was truncated to its tail. Every multi-flag invocation here is written to a script file with a
+  here-doc and then executed.
+- **Always qualify the image as `localhost/`.** With both `docker.io/library/claude-tools:latest` and
+  `localhost/claude-tools:latest` present, an unqualified `FROM claude-tools:latest` resolved to the docker.io one and
+  silently built on a stale bookworm base. Every reference below carries the `localhost/` prefix.
+
+### Step 1 — rebuild and verify the base image
+
+A stale base invalidates everything downstream.
 
 ```
-export SPIKE_IMAGE=claude-tools:spike
-export SPIKE_VOL=claude-tools-spike-store
-export REPO="$PWD"
-export CUSER="$(id -un)"          # container user name; "claude" unless CLAUDE_TOOLS_USER was overridden
+./build.sh
+podman run --rm localhost/claude-tools:latest shell -lc \
+  'grep VERSION_CODENAME /etc/os-release; echo "user=$(id -un) uid=$(id -u) gid=$(id -g)"'
 ```
 
-### Step 1 — host facts
+Expected, and observed on 2026-09-03: `VERSION_CODENAME=trixie`, `user=claude`. **If the codename is not `trixie`, stop
+and rebuild.** Note that `build.sh` must pass `--format docker` (commit `4e35c5a`) or the SDKMAN! step fails, because
+podman ignores `SHELL` in OCI format — see §5.2b.
+
+### Step 2 — host facts
 
 ```
 id -u; id -g
 grep "^$(id -un):" /etc/subuid /etc/subgid
 podman --version; uname -r
+cat /proc/sys/user/max_user_namespaces
 ls -l /dev/fuse /dev/net/tun
 ```
 
-Expected: a subuid line such as `you:100000:65536`, and both device nodes present. **If `/etc/subuid` has no entry for
-you, stop** — rootless podman is not set up on this host and nothing further is meaningful.
+**If `/etc/subuid` has no entry for you, stop** — rootless podman is not set up on this host. Observed values are in
+§5.10.
 
-### Step 2 — package names and the outer mapping
+### Step 3 — measure the outer mapping and derive the ranges
 
-Answers the open item in §5.2 before anything is built:
-
-```
-podman run --rm docker.io/library/debian:trixie-slim sh -c \
-  'apt-get update -qq && apt-cache policy podman uidmap fuse-overlayfs passt slirp4netns catatonit podman-compose'
-```
-
-Expected: a candidate version for each. Record anything missing or differently named.
-
-Now read the mapping the outer container actually gets — this is what the inner subuid range must fit inside:
+Against the **plain** image: this is the mapping `--userns=keep-id` gives the outer container, and it is not observable
+from inside the spike image. Look at it by eye first:
 
 ```
-podman run --rm --userns=keep-id claude-tools:latest \
+cat > "$TMPDIR/map.sh" <<'EOF'
+podman run --rm --userns=keep-id localhost/claude-tools:latest \
   shell -lc 'cat /proc/self/uid_map; echo ---; cat /proc/self/gid_map'
+EOF
+bash "$TMPDIR/map.sh"
 ```
 
-Expected shape, columns `inside outside count`, with your uid mapped to itself and the rest drawn from your subuid
-range:
+Columns are `inside outside count`. Let `U` be the container-side uid of the image user — the left-hand column of the
+line whose count is `1` — and `TOTAL` the sum of the `count` column, the number of container-side ids that exist at all.
+The inner range starts just above `U` and runs to the end of what is mapped:
 
 ```
-         0     100000       1000
-      1000          0          1
-      1001     101000      64536
+START = U + 1
+COUNT = TOTAL - START
 ```
 
-**Derive the candidate range from the left-hand column; do not hardcode one.** The inner `/etc/subuid` range must lie
-within the container-side ids listed there and must not contain your own uid. For the shape above the candidate is
-`1001:64536`:
+Observed on the user's host: `uid_map` of `0→1 (1001)`, `1001→0 (1)`, `1002→1002 (64535)`, so `TOTAL = 65537`,
+`START = 1002`, `COUNT = 64535` → `claude:1002:64535`; and `claude:1004:64533` for gids.
+
+**Compute it rather than typing it.** This is the gate — nothing below accepts a hand-entered value:
 
 ```
-export SPIKE_SUBUID=1001:64536     # replace with what this step actually showed
+cat > "$TMPDIR/derive.sh" <<'EOF'
+set -eu
+IMG=localhost/claude-tools:latest
+read -r SPIKE_USER SPIKE_UID SPIKE_GID < <(
+  podman run --rm --userns=keep-id "$IMG" shell -lc 'echo "$(id -un) $(id -u) $(id -g)"')
+UID_TOTAL=$(podman run --rm --userns=keep-id "$IMG" shell -lc 'cat /proc/self/uid_map' | awk '{t+=$3} END{print t}')
+GID_TOTAL=$(podman run --rm --userns=keep-id "$IMG" shell -lc 'cat /proc/self/gid_map' | awk '{t+=$3} END{print t}')
+SPIKE_SUBUID="$((SPIKE_UID + 1)):$((UID_TOTAL - SPIKE_UID - 1))"
+SPIKE_SUBGID="$((SPIKE_GID + 1)):$((GID_TOTAL - SPIKE_GID - 1))"
+[ -n "$SPIKE_USER" ] && [ "${SPIKE_SUBUID##*:}" -gt 1000 ] && [ "${SPIKE_SUBGID##*:}" -gt 1000 ] \
+  || { echo "STOP: ranges not derived - do not build"; exit 1; }
+printf 'export SPIKE_USER=%s SPIKE_UID=%s SPIKE_GID=%s\n' "$SPIKE_USER" "$SPIKE_UID" "$SPIKE_GID"
+printf 'export SPIKE_SUBUID=%s SPIKE_SUBGID=%s\n' "$SPIKE_SUBUID" "$SPIKE_SUBGID"
+EOF
+bash "$TMPDIR/derive.sh" > "$TMPDIR/spike.env" && cat "$TMPDIR/spike.env" && . "$TMPDIR/spike.env"
+export SPIKE_IMAGE=localhost/claude-tools:spike SPIKE_VOL=claude-tools-spike-store REPO="$PWD"
 ```
 
-### Step 3 — build a scratch image
+**`SPIKE_USER` must be the in-container name, not your host login.** That mismatch invalidated the first run.
 
-Not committed. A throwaway layer over the real image, because the image has no sudo and packages cannot be installed in
-a running container.
+### Step 4 — build a scratch image
+
+Not committed. A throwaway layer over the real image, because the image has no sudo.
 
 ```
-cat > /tmp/Dockerfile.spike <<'SPIKE'
-FROM claude-tools:latest
-ARG SPIKE_UID=1000
+cat > "$TMPDIR/Dockerfile.spike" <<'SPIKE'
+FROM localhost/claude-tools:latest
 ARG SPIKE_USER=claude
-ARG SPIKE_SUBUID=1001:64536
+ARG SPIKE_UID=1000
+ARG SPIKE_GID=1000
+ARG SPIKE_SUBUID
+ARG SPIKE_SUBGID
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         podman uidmap fuse-overlayfs passt slirp4netns catatonit podman-compose \
     && rm -rf /var/lib/apt/lists/*
 RUN echo "${SPIKE_USER}:${SPIKE_SUBUID}" > /etc/subuid \
- && echo "${SPIKE_USER}:${SPIKE_SUBUID}" > /etc/subgid \
+ && echo "${SPIKE_USER}:${SPIKE_SUBGID}" > /etc/subgid \
  && mkdir -p "/run/user/${SPIKE_UID}" \
- && chown "${SPIKE_UID}:${SPIKE_UID}" "/run/user/${SPIKE_UID}"
-USER ${SPIKE_UID}
+ && chown "${SPIKE_UID}:${SPIKE_GID}" "/run/user/${SPIKE_UID}"
+USER ${SPIKE_UID}:${SPIKE_GID}
 ENV XDG_RUNTIME_DIR=/run/user/${SPIKE_UID}
 SPIKE
 
-podman build -f /tmp/Dockerfile.spike \
-  --build-arg SPIKE_UID="$(id -u)" --build-arg SPIKE_USER="$CUSER" \
+cat > "$TMPDIR/build-spike.sh" <<'EOF'
+set -eu
+podman build --format docker -f "$TMPDIR/Dockerfile.spike" \
+  --build-arg SPIKE_USER="$SPIKE_USER" \
+  --build-arg SPIKE_UID="$SPIKE_UID" \
+  --build-arg SPIKE_GID="$SPIKE_GID" \
   --build-arg SPIKE_SUBUID="$SPIKE_SUBUID" \
+  --build-arg SPIKE_SUBGID="$SPIKE_SUBGID" \
   -t "$SPIKE_IMAGE" "$REPO"
+EOF
+bash "$TMPDIR/build-spike.sh"
+```
 
+**Verify the entry before going further** — this single check would have caught the first run's defect:
+
+```
+podman run --rm "$SPIKE_IMAGE" shell -lc \
+  'echo "I am $(id -un)"; echo "-- subuid"; cat /etc/subuid; echo "-- subgid"; cat /etc/subgid; podman --version'
 podman images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep -E 'claude-tools:(latest|spike)'
 ```
 
-Expected: both tags listed, the spike one larger. **Record the difference** — that is the image-growth figure §8 quotes
-as unverified.
+Expected: the name after `I am` is **identical** to the name at the start of both files, and podman reports 5.4.x. If
+the names differ, `SPIKE_USER` is wrong and every reading below is a false negative. **Record the size difference** —
+that is the image-growth figure §5.2 still needs on a trixie base.
 
-### Step 4 — the decisive reading
+### Step 5 — the working configuration
+
+The flags below are the ones that worked. `--cap-add=all` is **required**: without it `newuidmap` fails and no image
+that drops privileges can start, regardless of bubblewrap (§5.6).
 
 ```
+cat > "$TMPDIR/run-spike.sh" <<'EOF'
+set -eu
 podman run --rm -it --init \
   --userns=keep-id \
   --security-opt seccomp=unconfined \
   --security-opt unmask=ALL \
+  --cap-add=all \
   --device /dev/fuse --device /dev/net/tun \
   -v "$REPO:/workspace" \
-  -v "$HOME/.claude:/home/$CUSER/.claude" \
-  -v "$HOME/.claude.json:/home/$CUSER/.claude.json" \
-  -v "$SPIKE_VOL:/home/$CUSER/.local/share/containers" \
+  -v "$HOME/.claude:/home/$SPIKE_USER/.claude" \
+  -v "$HOME/.claude.json:/home/$SPIKE_USER/.claude.json" \
+  -v "$SPIKE_VOL:/home/$SPIKE_USER/.local/share/containers" \
   --workdir /workspace \
   "$SPIKE_IMAGE" shell
+EOF
+bash "$TMPDIR/run-spike.sh"
 ```
 
 Inside that shell:
 
 ```
 podman unshare cat /proc/self/uid_map
-```
-
-**This single reading decides whether S5 onward proceeds.**
-
-- **More than one mapping line** — `newuidmap` works under `--userns=keep-id`, a subuid range is available, and images
-  that drop privileges can run. Proceed with the design as written.
-- **Exactly one line, or an error** such as `newuidmap: write to uid_map failed: Operation not permitted` or
-  `no subuid ranges found for user` — only a single id is mapped, so `postgres`, `rabbitmq` and any non-root MinIO
-  cannot start. Retry once with a different `SPIKE_SUBUID` derived from step 2. If it still fails, **stop**: the
-  podman-only wave (S2-S4) still lands, and S5 onward is abandoned.
-
-Then, in the same shell:
-
-```
 podman info --format '{{.Store.GraphDriverName}}'
-```
-
-Expected `overlay`. `vfs` means `fuse-overlayfs` is not working — usable, but slow enough to matter for the startup
-timeouts in §6. Record which.
-
-### Step 5 — a privilege-dropping image, end to end
-
-Still in the same shell. This is the case the whole design exists for:
-
-```
 podman run -d --rm --name pg -e POSTGRES_PASSWORD=x -p 15432:5432 docker.io/library/postgres:16
-podman logs -f pg          # expect "database system is ready to accept connections", then Ctrl-C
-(exec 3<>/dev/tcp/127.0.0.1/15432) && echo REACHABLE
+podman logs -f pg          # "database system is ready to accept connections", then Ctrl-C
+(exec 3<>/dev/tcp/127.0.0.1/15432) && echo PORT-REACHABLE
 podman rm -f pg
 ```
 
-Expected: ready, and `REACHABLE`. Failure to publish the port points at `/dev/net/tun` and the rootless network
-namespace; failure to start points back at step 4.
+Observed: multiple mapping lines, `overlay`, postgres ready as uid 999, `PORT-REACHABLE`.
 
-Ownership, which validates the table in §5.9:
+**If any of that regresses, check three things before concluding the design fails.** The first run failed on all three
+and produced a false negative:
+
+1. **Username mismatch.** `podman run --rm "$SPIKE_IMAGE" shell -lc 'id -un; head -1 /etc/subuid'` — must be the same
+   string.
+2. **Stale or wrongly-resolved base.** Check `VERSION_CODENAME` in `/etc/os-release` and `podman --version` inside.
+   Expect `trixie` and podman 5.4.x, and check the `localhost/` prefix.
+3. **Range outside the outer mapping**, or `--cap-add=all` omitted. Compare `/etc/subuid` against step 3's `uid_map`.
+
+### Step 6 — ownership *(outstanding — §10 question 6)*
+
+Validates the table in §5.9, which currently rests on reasoning rather than observation. In the spike shell:
 
 ```
 mkdir -p /workspace/spike-data
 podman run --rm -v /workspace/spike-data:/data docker.io/library/alpine sh -c 'id -u; touch /data/as-root'
 podman run --rm --user 999 -v /workspace/spike-data:/data docker.io/library/alpine \
   sh -c 'id -u; touch /data/as-999 || echo DENIED'
-podman image inspect --format '{{.Config.User}}' quay.io/minio/minio      # §10 question 3
+podman image inspect --format '{{.Config.User}}' quay.io/minio/minio      # §10 question 5
 ```
 
-Then, **on the host**, in the repository:
-
-```
-ls -ln spike-data
-```
+Then, **on the host**, in the repository: `ls -ln spike-data`.
 
 Expected: `as-root` owned by your own uid and gid; `as-999` either absent with `DENIED`, or present and owned by a host
 subuid you cannot manage. Anything else refutes §5.9 and that section must be rewritten. Clean up with
-`podman unshare rm -rf spike-data`, and record whether it was needed and whether it worked.
+`podman unshare rm -rf spike-data`, recording whether it was needed and whether it worked.
 
-### Step 6 — the bubblewrap comparison
+### Step 7 — the bubblewrap comparison *(outstanding — §10 question 2)*
 
-The assumption in §5.6, tested both ways in the same container. Outside the sandbox is the shell you are already in,
-where step 4 succeeded. Start the service and check the remote client:
+This no longer decides whether the service exists — §4 justifies that on the API — but it decides whether the agent can
+usefully run `podman` locally as well as remotely. In the spike shell:
 
 ```
 podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" &
 export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
 export CONTAINER_HOST="$DOCKER_HOST"
 podman --remote info --format '{{.Store.GraphDriverName}}'
-```
 
-Expected: the same driver name as step 4. Then the sandboxed case, from that same shell, with the repository's own
-settings in place so `sandbox.enabled` is true:
-
-```
 cp /workspace/settings.json "$HOME/.claude/settings.json"
 claude -p 'Run the shell command `podman info --format {{.Store.GraphDriverName}}` and paste its exact output.'
 claude -p 'Run the shell command `podman --remote info --format {{.Store.GraphDriverName}}` and paste its exact output.'
@@ -686,13 +810,14 @@ claude -p 'Run the shell command `podman --remote info --format {{.Store.GraphDr
 
 Readings:
 
-- **First fails, second succeeds** — the expected result. `no_new_privs` blocks the local CLI inside bubblewrap and the
-  socket path works. S6 is justified as designed, and §10 question 1 is answered *yes, the sandbox permits the socket*.
-- **Both succeed** — the `no_new_privs` assumption is wrong. Record it: S6 may be unnecessary and the design simplifies.
-- **Both fail** — the sandbox blocks the socket as well. §10 question 1 is answered *no* and S9 has real work; capture
-  the exact error, since it determines whether `settings.json` can express the allowance at all.
+- **Local fails, remote succeeds** — the socket is what the agent must use. S6 as designed, and §10 question 3 is
+  answered *yes, the sandbox permits the socket*.
+- **Both succeed** — bubblewrap blocks neither. The agent may use the CLI directly; the service still exists for
+  Testcontainers.
+- **Both fail** — the sandbox blocks the socket too. §10 question 3 is answered *no* and S9 has real work; capture the
+  exact error, since it determines whether `settings.json` can express the allowance at all.
 
-### Step 7 — Ryuk
+### Step 8 — Ryuk *(outstanding — §10 question 4)*
 
 A cheap proxy for a full Testcontainers run; Ryuk's distinguishing requirement is bind-mounting the socket into a
 container:
@@ -701,17 +826,15 @@ container:
 podman run --rm -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/docker.sock" docker.io/testcontainers/ryuk:0.11.0
 ```
 
-Expected: it starts and logs that it is listening. If it does, §5.7 uses `TESTCONTAINERS_RYUK_PRIVILEGED=true`; if it
-fails, `TESTCONTAINERS_RYUK_DISABLED=true`. Record which, answering §10 question 2. This is a proxy, not the real thing
-— note it as such.
+If it starts and logs that it is listening, §5.7 uses `TESTCONTAINERS_RYUK_PRIVILEGED=true`; if it fails,
+`TESTCONTAINERS_RYUK_DISABLED=true`. A proxy, not the real thing — note it as such.
 
-### Step 8 — tidy up and record
+### Step 9 — tidy up and record
 
 ```
 exit
-podman rmi "$SPIKE_IMAGE"; podman volume rm "$SPIKE_VOL"; rm /tmp/Dockerfile.spike
+podman rmi "$SPIKE_IMAGE"; podman volume rm "$SPIKE_VOL"
+rm -f "$TMPDIR"/Dockerfile.spike "$TMPDIR"/*.sh "$TMPDIR"/spike.env
 ```
 
-Fold the observed answers back into §5.2 (package names, subuid range, image size), §5.6 (the bubblewrap verdict), §5.7
-(the Ryuk variable), §5.9 (the ownership table and MinIO's default user) and §10, then commit as
-`Record the nested podman spike results`.
+Fold anything new into §5.2 (image size on trixie), §5.6, §5.7, §5.9 and §5.10, and update §10.
