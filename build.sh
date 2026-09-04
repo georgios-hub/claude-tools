@@ -86,7 +86,16 @@ echo "    python : ${PYTHON_VERSION}   java: ${JAVA_VERSION}"
 echo "    maven  : ${MAVEN_VERSION}   gradle: ${GRADLE_VERSION}"
 echo
 
+# The Dockerfile sets SHELL to bash so that SDKMAN!'s bash-only init script can be
+# sourced and pipefail applies to the `curl | bash` pipelines. SHELL is a Docker
+# format instruction: podman builds OCI by default, silently ignores it, and falls
+# back to /bin/sh -- where `set -o pipefail` and `source` do not exist and the
+# SDKMAN! step fails. Asking podman for the docker format keeps SHELL effective.
+FORMAT_ARGS=()
+[ "$(basename -- "$ENGINE")" = "podman" ] && FORMAT_ARGS+=(--format docker)
+
 "${ENGINE}" build \
+    "${FORMAT_ARGS[@]}" \
     --build-arg "USER_NAME=${USER_NAME}" \
     --build-arg "USER_UID=${USER_UID}" \
     --build-arg "USER_GID=${USER_GID}" \
