@@ -3,6 +3,11 @@
 Containerized Claude Code with a ready-made toolchain (node/npm, pyenv, SDKMAN!)
 and agents/settings version-controlled in this repository.
 
+The container engine is **podman**, and only podman. `build.sh` and
+`run-claude.sh` both require it on `PATH` and error out if it is missing, and
+`run-claude.sh` additionally requires it rootless. If you were using docker, see
+*Migrating from docker* below.
+
 ## Files
 
 | File                   | Purpose                                                                  |
@@ -35,6 +40,28 @@ Useful flags:
 ```
 
 The first build takes roughly 5–10 minutes, because `pyenv install` compiles CPython from source.
+
+### Migrating from docker
+
+Docker used to be selectable with `--engine docker` or `CONTAINER_ENGINE=docker`.
+Both are gone, and there is no fallback: if that is how you were running this,
+install podman and **rebuild**. A docker-built image sits in docker's store, and a
+podman-only `run-claude.sh` never reads it.
+
+None of the old invocations still means anything. The two flags say so; the
+variable does not:
+
+- `./build.sh --engine docker` forwards the unknown flag on to `podman build`,
+  which rejects it with `Error: unknown flag: --engine`.
+- `run-claude.sh` does not recognize `--engine` at all: it stops parsing its own
+  options there and forwards the rest to `claude`, which exits with
+  `error: unknown option '--engine'`. The container starts and dies immediately.
+  Any `run-claude.sh` option placed after `--engine` — a `--network`, a
+  `--mount` — never reaches the script. `shell` does reach the container, but
+  the entrypoint only honours it in first position, and first position is
+  `--engine`.
+- `CONTAINER_ENGINE=docker` is ignored, and nothing says so: neither script
+  reads the variable any more, so the build simply succeeds with podman.
 
 ## Run
 
@@ -78,16 +105,29 @@ the host's `~/.claude`, so inside the container they shadow the host's copies. T
 ### `run-claude.sh` options (before the claude arguments)
 
 ```
---image <tag>        default: claude-tools:latest  (or $CLAUDE_TOOLS_IMAGE)
+--image <tag>        default: claude-tools:latest
 --workdir <path>     what to mount as /workspace (default: $PWD)
 --mount <src:dst>    additional bind mount (repeatable)
 --env K=V            additional environment variable (repeatable)
---network <mode>     default: bridge  (e.g. none, to run offline)
+--network <mode>     default: podman's own  (e.g. none, to run offline)
 --name <name>        container name
 --no-agents-mount    /  --no-settings-mount
 --no-sandbox         drop the security options Claude's sandbox needs
 --                   end of this script's options
 ```
+
+Three environment variables supply defaults:
+
+| Variable               | Read by                     | Sets                                                                     |
+|------------------------|-----------------------------|--------------------------------------------------------------------------|
+| `CLAUDE_TOOLS_IMAGE`   | `build.sh`, `run-claude.sh` | the image tag — the default for `--tag` and `--image`                    |
+| `CLAUDE_TOOLS_USER`    | `build.sh`, `run-claude.sh` | the user inside the container (`claude`) — `build.sh --user` sets it too |
+| `CLAUDE_TOOLS_NETWORK` | `run-claude.sh`             | the default for `--network`                                              |
+
+`CLAUDE_TOOLS_USER` is the only way to tell `run-claude.sh`, which has no flag
+for it, and it has to be the user the image was actually built with:
+`run-claude.sh` derives the container-side home directory of the home-directory
+mounts from it, so a mismatch puts `~/.claude` in a home that does not exist.
 
 These are forwarded automatically when set in your environment:
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
@@ -99,21 +139,23 @@ These are forwarded automatically when set in your environment:
 bubblewrap for filesystem isolation plus socat for the network filter, so both
 packages are installed in the image.
 
-Running bubblewrap *inside* Docker also needs three of Docker's own restrictions
+Running bubblewrap *inside* podman also needs two of podman's own restrictions
 lifted, which `run-claude.sh` passes by default:
 
 | Option | Without it |
 |---|---|
 | `--security-opt seccomp=unconfined` | `bwrap: No permissions to create new namespace` — the default seccomp profile rejects `clone(CLONE_NEWUSER)` |
-| `--security-opt apparmor=unconfined` | `bwrap: Failed to make / slave: Permission denied` |
-| `--security-opt systempaths=unconfined` | `bwrap: Can't mount proc on /newroot/proc` — Docker's masked `/proc` paths block the remount |
+| `--security-opt unmask=ALL` | `bwrap: Can't mount proc on /newroot/proc` — podman's masked `/proc` paths block the remount |
 
-No extra capability is needed: `--cap-add SYS_ADMIN` and `--privileged` make no
-difference, so neither is used.
+There is no AppArmor row because there is nothing to lift: a rootless podman
+container gets no AppArmor profile in the first place.
 
-The trade-off is worth stating plainly: these options weaken Docker's own
+No added capability is needed for Claude's sandbox, so `run-claude.sh` passes
+none.
+
+The trade-off is worth stating plainly: these options weaken podman's own
 confinement of the container in exchange for Claude's sandbox working inside it.
-If you would rather keep Docker's defaults, run `./run-claude.sh --no-sandbox` and set
+If you would rather keep podman's defaults, run `./run-claude.sh --no-sandbox` and set
 `"sandbox": {"enabled": false}` in `settings.json` — otherwise Claude will report
 that the sandbox is enabled but cannot start.
 
@@ -127,6 +169,9 @@ only for paths you mount yourself with `--mount`, using the container-side path.
 - The `claude` user (with your own uid/gid) is **not a sudoer**: the `sudo`
   package is never installed in the image and there is no entry in
   `/etc/sudoers`. Anything requiring root has to go into the `Dockerfile`.
+- Podman has to be **rootless**: `run-claude.sh` refuses to run when `id -u` is 0.
+  Under `sudo podman` the container's uid 0 *is* host uid 0, so anything the
+  container writes through a bind mount lands on the host owned by root.
 - `settings.json` uses `defaultMode: "default"`. For a looser flow inside the container, change it to `"acceptEdits"` or
   run
   `./run-claude.sh --dangerously-skip-permissions`.
