@@ -194,9 +194,9 @@ ENV BASH_ENV=${HOME}/.claude-tools-env.sh
 #    network namespaces. It can only bind-mount paths that exist in here, so the
 #    host filesystem is out of reach by construction rather than by policy, and
 #    a published port lands on the same localhost as the test process. The
-#    devices and capabilities this needs do not exist in run-claude.sh yet: a
-#    later step (S7) adds an opt-in --containers flag that grants them. Until it
-#    lands, the packages below are installed but inert.
+#    devices and capabilities this needs are granted by run-claude.sh's
+#    --containers flag, which is off by default: without it the packages below
+#    are installed but inert.
 #
 #    Each package, and what it buys:
 #      podman          the engine, and `podman system service`, which serves the
@@ -252,17 +252,75 @@ ENV BASH_ENV=${HOME}/.claude-tools-env.sh
 #                      missing package.
 #      catatonit       the minimal init process podman runs for `--init`, so a
 #                      spawned container reaps its own zombies.
+#      podman-compose  compose support: a repository's own docker-compose.yml,
+#                      brought up and torn down from its own directory under
+#                      /workspace. It is a Python program that drives the
+#                      `podman` CLI rather than speaking the API socket itself,
+#                      so it follows the CLI into remote mode -- podman(1) makes
+#                      --remote default to true when CONTAINER_HOST is set --
+#                      and so reaches the service the entrypoint starts.
+#                      `podman compose` gets there from the other side:
+#                      `podman help compose` ends "The default compose
+#                      providers are docker-compose and podman-compose", and
+#                      with only the second installed it delegates -- observed,
+#                      in remote mode, as `Executing external compose provider
+#                      "/usr/bin/podman-compose".`
 #
-#    No compose implementation here: that is added separately and extends this
-#    section. podman-docker is a different case -- it is not missing but
-#    rejected, and is never to be installed: the agent is told podman is the
-#    only engine, so a `docker` shim buys nothing.
+#                      That chain is also the triage when it breaks. With
+#                      CONTAINER_HOST unset -- --containers not given, or the
+#                      service failed to start and the entrypoint carried on as
+#                      it is meant to -- nothing reports a socket error at all:
+#                      the CLI simply runs locally, and without the
+#                      capabilities --containers grants it dies with `newuidmap:
+#                      write to uid_map failed: Operation not permitted`. That
+#                      is the same string a subordinate id range too narrow to
+#                      use produces (see below). Two causes, one message: check
+#                      CONTAINER_HOST before suspecting the ranges.
+#
+#                      The limitation is the direct cost of dropping docker and
+#                      is not papered over: there is no `docker` binary in this
+#                      image, so a foreign repository that runs `docker compose
+#                      up` itself still fails -- in wordings that do not grep
+#                      for one another. Measured:
+#
+#                        sh: 1: docker: not found
+#                        bash: line 1: docker: command not found
+#                        make: docker: No such file or directory
+#                        make: *** [Makefile:2: all] Error 127
+#
+#                      GNU make execs a recipe with no shell metacharacters
+#                      itself instead of handing it to a shell, so that message
+#                      is make's own and holds neither "compose" nor "command
+#                      not found"; and /bin/sh here is dash, which says "not
+#                      found" where bash says "command not found". What carries
+#                      over is the compose *file*, not the command line around
+#                      it -- the agent runs podman-compose against it itself.
+#
+#                      Which interpreter runs it is the part that could have
+#                      been silently wrong. The Debian package's
+#                      /usr/bin/podman-compose has an absolute
+#                      `#! /usr/bin/python3` shebang, so it runs Debian's own
+#                      python and imports podman_compose, yaml and dotenv from
+#                      /usr/lib/python3/dist-packages. The ENV PATH set above
+#                      section 4 puts pyenv's shims ahead of /usr/bin for the
+#                      claude user, and that interpreter cannot see
+#                      dist-packages, so an `#!/usr/bin/env python3` shebang
+#                      would have picked it and failed with ModuleNotFoundError.
+#                      python3-yaml and python3-dotenv are hard Depends rather
+#                      than Recommends, so the --no-install-recommends below
+#                      leaves them in -- unlike nftables and aardvark-dns above.
+#
+#    podman-docker, which would supply the missing `docker` command as a shim
+#    over podman, is rejected and is never to be installed: the agent is told
+#    podman is the only engine and runs the compose file itself, so the shim
+#    buys nothing.
 # ---------------------------------------------------------------------------
 USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         podman uidmap fuse-overlayfs passt slirp4netns catatonit \
         nftables aardvark-dns \
+        podman-compose \
     && rm -rf /var/lib/apt/lists/*
 
 #    Subordinate id ranges for the image user. The customary
@@ -342,8 +400,9 @@ RUN set -e; \
 #
 #    None of the three has a per-user counterpart in this image, so all three
 #    are what the rootless user actually gets. /etc is also outside every mount
-#    run-claude.sh makes by default -- /workspace, ~/.claude, ~/.claude.json,
-#    ~/.gitconfig, and the image-store volume S7 will add under ~/.local/share.
+#    run-claude.sh makes of its own accord -- /workspace, ~/.claude,
+#    ~/.claude.json, ~/.gitconfig, and, under --containers, the image-store
+#    volume on ~/.local/share/containers.
 #    (Its --mount flag takes an arbitrary src:dst and is repeatable, so "cannot
 #    be shadowed" would be too strong; nothing shadows it unless someone asks
 #    for that.)
@@ -371,8 +430,9 @@ RUN set -e; \
 #      graphroot = /home/claude/.local/share/containers/storage
 #      runroot   = /run/user/1001/containers
 #
-#    S7 will mount a named image-store volume one level above the graphroot, on
-#    ~/.local/share/containers, and that is what will keep pulled images between
+#    Under --containers, run-claude.sh mounts the named volume
+#    claude-tools-containers one level above that graphroot, on
+#    ~/.local/share/containers, and that is what keeps pulled images between
 #    runs. The volume is not merely an optimisation -- fuse-overlayfs
 #    cannot stack on this container's own overlayfs, so the inner store has to
 #    sit on a real filesystem.
@@ -421,9 +481,12 @@ RUN mkdir -p /etc/containers /etc/containers/registries.conf.d \
 #    existing /run content up into it, so the directory created here does
 #    survive into the running container -- measured as
 #    `drwx------ claude claude /run/user/1001`. It is created here for that
-#    reason and not as a best effort. (If a future engine or option mounts /run
-#    without tmpcopyup, the directory would be lost and the entrypoint would have
-#    to recreate it; nothing in the tree does that today.)
+#    reason and not as a best effort -- but it is not the only line of defence:
+#    with the service enabled, docker-entrypoint.sh mkdir -p's the socket
+#    directory below it, which recreates this one on the way, and chmods both to
+#    0700. Created by the user itself it comes back correctly owned, so an
+#    engine or an option that mounted /run without tmpcopyup would not take the
+#    service down with it.
 RUN mkdir -p "/run/user/${USER_UID}" \
     && chown "${USER_UID}:${USER_GID}" "/run/user/${USER_UID}" \
     && chmod 700 "/run/user/${USER_UID}"
