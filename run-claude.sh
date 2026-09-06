@@ -24,6 +24,7 @@
 #   --no-agents-mount    do not mount <repo>/agents
 #   --no-settings-mount  do not mount <repo>/settings.json
 #   --no-sandbox         drop the security options that Claude's sandbox needs
+#   --containers         start containers inside this one (see the note below)
 #   --network <mode>     network mode (default: podman's own)
 #   --name <name>        container name
 #   --                   end of this script's options
@@ -31,6 +32,19 @@
 # podman is the only supported engine and has to be on PATH; there is no docker
 # fallback. It also has to be rootless: the script refuses to run as root, since
 # under sudo a bind mount becomes a way to write root-owned files onto the host.
+#
+# --containers lets the agent start its own containers inside this one, as
+# children of it, and is off by default. It grants the container --cap-add=all,
+# without which the inner rootless podman cannot map its subuid range. Those
+# capabilities apply inside the container's user namespace and not on the host,
+# so they are not host privilege -- but the container is materially less
+# confined than without the flag, which is why it is opt-in. It cannot be
+# combined with --no-sandbox.
+#
+# The capability is not the whole cost. The containers the agent starts run
+# outside Claude's sandbox and outside settings.json's deny list, so anything
+# started in one can read the credentials in the mounted ~/.claude, and the
+# images it pulls are never seen by the sandbox's network filter.
 
 set -euo pipefail
 
@@ -48,6 +62,7 @@ CONTAINER_NAME=""
 MOUNT_AGENTS=1
 MOUNT_SETTINGS=1
 ENABLE_SANDBOX=1
+ENABLE_CONTAINERS=0
 EXTRA_MOUNTS=()
 EXTRA_ENVS=()
 
@@ -65,11 +80,22 @@ while [[ $# -gt 0 ]]; do
         --no-agents-mount)   MOUNT_AGENTS=0; shift ;;
         --no-settings-mount) MOUNT_SETTINGS=0; shift ;;
         --no-sandbox)        ENABLE_SANDBOX=0; shift ;;
+        --containers)        ENABLE_CONTAINERS=1; shift ;;
         --help)              usage 0 ;;
         --)                  shift; break ;;
         *)                   break ;;
     esac
 done
+
+# --containers needs exactly the two security options that --no-sandbox drops,
+# so the combination cannot do what it asks for. Checked here, after the whole
+# command line has been parsed, so the order of the two flags does not matter.
+if [ "$ENABLE_CONTAINERS" -eq 1 ] && [ "$ENABLE_SANDBOX" -eq 0 ]; then
+    echo "error: --containers and --no-sandbox are mutually exclusive" >&2
+    echo "       the inner podman needs the seccomp=unconfined and unmask=ALL" >&2
+    echo "       that --no-sandbox drops" >&2
+    exit 1
+fi
 
 WORKDIR_HOST="$(cd -- "$WORKDIR_HOST" && pwd)"
 
@@ -132,6 +158,48 @@ PODMAN_ARGS+=(--userns=keep-id)
 if [ "$ENABLE_SANDBOX" -eq 1 ]; then
     PODMAN_ARGS+=(--security-opt seccomp=unconfined)
     PODMAN_ARGS+=(--security-opt unmask=ALL)
+fi
+
+# Nested containers. The agent's own containers are children of this one, run by
+# a podman API service that docker-entrypoint.sh starts when it sees
+# CLAUDE_TOOLS_CONTAINERS set to 1 -- the value is the contract, and it is this
+# flag's only trigger. CONTAINER_HOST and DOCKER_HOST are deliberately not set
+# here: the entrypoint exports them once it has confirmed the socket is there,
+# so a service that failed to start never leaves them pointing at nothing.
+#
+# --cap-add=all is a genuine security concession, and the reason this is opt-in
+# rather than always on. Without it the inner podman cannot map its subuid
+# range: newuidmap fails and no image that drops privileges will start. A
+# narrower grant does not work: --cap-add=setuid,setgid alone changes nothing,
+# and which capability is the operative one is not known; narrowing this to a
+# named set is the obvious improvement to make once it is.
+# What it costs: the capabilities are granted inside the container's user
+# namespace and not on the host, so they confer no host privilege, but the
+# container is materially less confined than it is without the flag.
+# --privileged also works and is deliberately not used: it is strictly broader,
+# additionally exposing host devices, and buys nothing more.
+#
+# The capability is not the whole cost either. The containers the agent starts
+# run outside Claude's sandbox and outside settings.json's deny list -- both
+# constrain Claude's own tools, not a process in another container -- so they
+# can read the credentials in the mounted ~/.claude, and their image pulls
+# never reach the sandbox's network filter.
+#
+# The devices are what the inner podman needs to run rootless: /dev/fuse for
+# fuse-overlayfs, /dev/net/tun for the pasta/slirp4netns network namespace.
+#
+# The volume is not just a cache. This container's own filesystem is overlayfs
+# and fuse-overlayfs cannot stack on it, so the inner image store has to sit on
+# a real one; keeping images between runs is the second reason. No :U suffix --
+# under --userns=keep-id the host uid maps to itself, so podman creates the
+# volume already owned by the container user, and :U would chown the whole
+# store on every run. Reclaim it with `podman volume rm claude-tools-containers`.
+if [ "$ENABLE_CONTAINERS" -eq 1 ]; then
+    PODMAN_ARGS+=(--cap-add=all)
+    PODMAN_ARGS+=(--device /dev/fuse)
+    PODMAN_ARGS+=(--device /dev/net/tun)
+    PODMAN_ARGS+=(-v "claude-tools-containers:$CONTAINER_HOME/.local/share/containers")
+    PODMAN_ARGS+=(-e CLAUDE_TOOLS_CONTAINERS=1)
 fi
 
 # Allocate a TTY only when there is a real terminal (otherwise: -p "...", CI).
