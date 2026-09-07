@@ -38,7 +38,13 @@ A second, related requirement arrived with the same task: the treatment of docke
 - Mounting the host engine's socket into the container. Rejected on the mount requirement — see §7.
 - Renaming `docker-entrypoint.sh`. It is a conventional filename, not an engine declaration; renaming it is churn across
   the `Dockerfile` and the README for no behavioural gain.
-- Changing the sandbox defaults. Claude's sandbox stays enabled; the design works with it on.
+- Weakening the sandbox itself. Claude's sandbox stays enabled and the design works with it on, but two things follow
+  that the original phrasing assumed away. `--cap-add=all` breaks bubblewrap outright — with it, every command inside
+  the container fails, not only podman but a bare `echo` too, with *"bwrap: Unexpected capabilities but not setuid, old
+  file caps config?"* — so the entrypoint drops every capability immediately before `exec claude` (§5.4). And no
+  sandbox setting lets a sandboxed process reach the engine at all, so the commands that need it are listed in
+  `sandbox.excludedCommands` and run outside the sandbox (§5.6). Both are part of the design rather than unstated
+  assumptions.
 - Enumerating supported service images. Any design that lists them in advance is wrong for this requirement.
 - Resource limits (CPU/memory) on spawned containers. Rootless podman inside a container has no cgroup delegation; see
   §8.
@@ -85,9 +91,10 @@ in `sandbox.filesystem.denyRead`, and contain no `Bash(podman *)` or `Bash(docke
 prompts. There is no application code, no test suite and no `docs/` directory. Commit titles are imperative, sentence
 case, no prefix (`Support podman as an alternative container engine`, `Default to podman, falling back to docker`).
 
-**Nothing in this document has been built or executed.** No container engine exists in the environment where the
-analysis was written; commit `a3ca3fe`, which moved the base image to Debian 13, has itself never been built. Every
-empirical claim below is marked with the command that would confirm it on a real host.
+**This section describes the repository as it stood when the analysis was written**, before any step of §9 landed:
+nothing here had been built or executed, no container engine existed in that environment, and commit `a3ca3fe`, which
+moved the base image to Debian 13, had never been built. Everything below is marked either as measured on the user's
+host, with the reading taken, or as unmeasured.
 
 ## 4. Proposed solution
 
@@ -106,9 +113,10 @@ host
     └── claude-tools container            uid = host uid via --userns=keep-id
         ├── podman system service         started by docker-entrypoint.sh, PID-1 context
         │   └── postgres / rabbitmq / …   grandchildren; die with the claude container
-        └── claude
-            └── bubblewrap                Claude's sandbox, wraps every Bash call
-                └── mvn / gradle / npm → talks to the service over a unix socket
+        └── claude                        all capabilities dropped before exec
+            ├── bubblewrap                Claude's sandbox, wraps every Bash call
+            └── podman / mvn / gradle / npm   excluded from the sandbox (§5.6); reach
+                                              the service on tcp://127.0.0.1:2375
 ```
 
 Three properties follow from that shape, and together they are the whole argument for it:
@@ -119,26 +127,34 @@ Three properties follow from that shape, and together they are the whole argumen
 - **`localhost` means the same thing to the test process and to the published port.** Both live in the claude
   container's network namespace, so a foreign repository's hard-coded `localhost:5432`, a Testcontainers
   `getMappedPort()`, and a container that needs to reach back into the test process all work with no overrides.
+  Measured with a real Testcontainers suite, which reported `TESTCONTAINERS-OK host=127.0.0.1 port=33287` and connected
+  to it. This holds for a process **outside** Claude's sandbox; a sandboxed process reaches neither the service nor a
+  published port, which is why the commands that need the engine are excluded from the sandbox (§5.6).
 - **Relative volumes resolve correctly.** A compose file's `./config:/etc/app` resolves against its own directory under
   `/workspace`, which exists in the same namespace.
 
 **Why the daemon is started by the entrypoint rather than invoked by the agent.** The reason is the API, not the
-sandbox: Testcontainers, dockerode, docker-py and the compose implementations all speak the Docker-compatible **socket**
+sandbox: Testcontainers, dockerode, docker-py and the compose implementations all speak the Docker-compatible **API**
 and never the CLI, so a service has to exist regardless. Starting `podman system service` from `docker-entrypoint.sh`,
-in the PID-1 context, is simply the earliest and simplest place to put it.
+in the PID-1 context, is simply the earliest and simplest place to put it. It is served on `tcp://127.0.0.1:2375` rather
+than on a unix socket, for the reason given in §5.6 and with the cost given in §5.8.
 
 An earlier draft justified it differently — that bubblewrap's `no_new_privs` neutralises the setuid-root
 `newuidmap`/`newgidmap` helpers. **The spike refuted that diagnosis** (§5.6): `newuidmap` fails for a capability reason
-that applies outside bubblewrap too, and is fixed on the outer container rather than inside. Whether bubblewrap
-*additionally* blocks the local CLI is still unmeasured and does not affect the case for the service.
+that applies outside bubblewrap too, and is fixed on the outer container rather than inside. Bubblewrap *does*
+additionally rule out the local CLI, but for a third reason again: after the entrypoint's capability drop (§5.4) the
+local `newuidmap` has no capabilities left to use, so the service is the only interface to the engine (§5.6). That
+sharpens the case for the service rather than changing it. What the sandbox does block is the *client* side: no
+sandboxed process can reach the service at all, over either transport, which is why the commands that talk to it run
+outside the sandbox (§5.6).
 
 **The core of this design is now verified.** The S1 spike brought up `postgres:16` nested, watched it drop to uid 999
 and report itself ready, and reached its published port from inside the claude container. See §5.10.
 
-**The agent's interface is `podman`.** `CONTAINER_HOST` points the podman CLI at the service, so `podman run …` works
-as a thin remote client. `DOCKER_HOST` is set to the same socket — not as an engine choice, but because Testcontainers,
-dockerode and docker-py inside *foreign* code read that variable and speak the Docker-compatible API that podman's
-service serves.
+**The agent's interface is `podman`.** `CONTAINER_HOST` points the podman CLI at `tcp://127.0.0.1:2375`, so
+`podman run …` works as a thin remote client. `DOCKER_HOST` is set to the same address — not as an engine choice, but
+because Testcontainers, dockerode and docker-py inside *foreign* code read that variable and speak the
+Docker-compatible API that podman's service serves.
 
 ## 5. Design detail
 
@@ -161,9 +177,22 @@ A new commented section in the `Dockerfile`, placed before the `USER` instructio
 | `podman`                    | the engine and the `system service` that serves the Docker-compatible API        |
 | `uidmap`                    | `newuidmap`/`newgidmap`, without which rootless podman cannot map a subuid range |
 | `fuse-overlayfs`            | the `overlay` storage driver rootless; needs `/dev/fuse` in the outer container  |
-| `passt` and/or `slirp4netns`| the rootless network namespace; needs `/dev/net/tun` in the outer container      |
+| `passt`                     | the rootless network namespace; needs `/dev/net/tun` in the outer container      |
+| `nftables`                  | netavark's packet filter; without it no user-defined network comes up            |
+| `aardvark-dns`              | container-to-container name resolution on those networks                        |
 | `catatonit`                 | podman's `--init` process for the containers the agent starts                    |
 | a compose implementation    | see §5.5                                                                         |
+
+`nftables` and `aardvark-dns` are `Recommends` of **netavark**, not of podman, so `--no-install-recommends` drops both,
+and neither omission is cosmetic. Without `nftables` netavark cannot set up a network and errors out with
+`Error: netavark: nftables error: unable to execute nft: No such file or directory`, so **no container starts on a
+user-defined network at all** — which is every compose project. Without `aardvark-dns` netavark logs
+`aardvark-dns binary not found, container dns will not be enabled` and continues, so containers start but cannot
+resolve one another by service name.
+
+`slirp4netns` was tried as the alternative rootless network backend and did **not** produce a working runtime in this
+configuration. `passt` (pasta) is what works, and `slirp4netns` is recorded as tried and rejected rather than as an
+untested second option.
 
 Per the user's instruction, this section documents each option and what it buys **in the `Dockerfile` itself**, matching
 the commentary style of sections 1-7 and of the sandbox block in `run-claude.sh`.
@@ -180,15 +209,27 @@ Also required in the same section:
   the build-arg uid and export it.
 - `containers.conf` with `cgroup_manager = "cgroupfs"` (there is no systemd in the container) and `events_logger =
   "file"`.
-- `storage.conf` selecting `overlay` with `mount_program = /usr/bin/fuse-overlayfs`, with `vfs` named as the documented
-  fallback.
+- `storage.conf` selecting `overlay` with `mount_program = /usr/bin/fuse-overlayfs`. `driver = "overlay"` is fixed
+  there; `vfs` is a manual edit of `/etc/containers/storage.conf`, not an automatic fallback (§6).
+- A `registries.conf` drop-in setting `unqualified-search-registries = ["docker.io"]`. Debian ships
+  `/etc/containers/registries.conf` with that key commented out, and its `shortnames.conf` carries no alias for
+  `postgres`, `rabbitmq`, `redis`, `mysql` or `mongo`. Without the drop-in, a compose file saying `image: postgres:16`
+  and Testcontainers' own unqualified defaults both fail with:
+
+  ```
+  Error: short-name "postgres:16" did not resolve to an alias and no unqualified-search registries are defined in
+  "/etc/containers/registries.conf"
+  ```
+
+**Why the spike found none of the three.** Appendix A step 5 uses fully-qualified image names throughout and never
+leaves the default network, so neither the registry search list nor netavark's helpers were ever exercised.
 
 Package names are **confirmed present in Debian 13**, measured on the user's host on 2026-09-03 with `apt-cache policy`
 inside `debian:trixie-slim`: `podman 5.4.2+ds1-2+b2`, `uidmap 1:4.17.4-2`, `fuse-overlayfs 1.14-1+b1`,
 `passt 0.0~git20250503.587980c-2+deb13u1`, `slirp4netns 1.2.1-1.1`, `catatonit 0.2.1-2+b13`, `podman-compose 1.3.0-1`.
 That open item is closed. The trixie base image measures **1.88 GB**, slightly smaller than the 1.96 GB bookworm one.
-Growth from adding podman and its dependencies was roughly 100 MB, but measured against the bookworm base — treat it as
-indicative and re-measure on trixie.
+With podman, its dependencies and the packages above, the image measures **2.06 GB** — growth of **180 MB**, measured
+on trixie.
 
 ### 5.2b Build format — a hard prerequisite
 
@@ -205,14 +246,30 @@ store must live on a real filesystem — a named volume. The same volume is what
 re-pulled on every run, which matters for a second reason given in §6: a first pull competing with a 60-second
 Testcontainers startup timeout produces a failure that reads exactly like a broken container.
 
-Proposed mount: `-v claude-tools-containers:/home/<user>/.local/share/containers`. Podman's `:U` suffix, which chowns
-the volume to the container user, is likely needed on first creation under `--userns=keep-id`; **verify** with
-`podman volume inspect` and an `ls -ln` inside the container.
+Mount: `-v claude-tools-containers:/home/<user>/.local/share/containers`. Podman's `:U` suffix, which chowns the volume
+to the container user, is **not needed and is not used**. Measured on a genuinely fresh volume, first creation, with no
+`:U`:
+
+```
+drwxr-xr-x 3 1001 1003 /home/claude/.local/share/containers
+```
+
+The mountpoint is already owned by the container user, because under `--userns=keep-id` the host uid maps to itself;
+`:U` would additionally chown the whole image store on every run. Both paths are measured rather than reasoned: the
+effective graphroot is `/home/<user>/.local/share/containers/storage`, and the named volume mounts one level above it,
+on `/home/<user>/.local/share/containers`.
 
 **The cost argument is softer than assumed.** The spike reported `Store.GraphDriverName = overlay`, so `fuse-overlayfs`
-does work with `--device /dev/fuse` and the `vfs` fallback — with its per-layer copies and slow first starts — may never
-be reached. Re-verify before relying on it; the volume is still required, because `fuse-overlayfs` cannot stack on the
-container's own overlayfs.
+does work with `--device /dev/fuse`, and `vfs` — with its per-layer copies and slow first starts — is not reached in the
+configuration this design ships: nothing selects it automatically (§6). The volume is still required, because
+`fuse-overlayfs` cannot stack on the container's own overlayfs.
+
+**The image store is shared between concurrent sessions.** The volume name `claude-tools-containers` is a constant,
+while the path it mounts on is derived from `CLAUDE_TOOLS_USER`. `run-claude.sh` uses `--rm` and no `--name` by default,
+so two simultaneous `--containers` sessions share one graphroot with two different runroots. Two consequences follow
+from the shared graphroot alone: images pulled by one session appear in the other, and a `podman system prune` in one
+removes layers the other may be using. Whether concurrent use costs anything beyond that is **unmeasured**. Recorded as
+a known consequence of the design, not as a task.
 
 ### 5.4 `run-claude.sh --containers`
 
@@ -220,7 +277,7 @@ Default **off**. When given, it adds:
 
 - **`--cap-add=all`** — required. See below; this is a genuine new concession.
 - `--device /dev/fuse` — for `fuse-overlayfs`.
-- `--device /dev/net/tun` — for pasta/slirp4netns, which the inner podman uses for its rootless network namespace.
+- `--device /dev/net/tun` — for pasta, which the inner podman uses for its rootless network namespace.
 - the named volume of §5.3.
 - `-e CLAUDE_TOOLS_CONTAINERS=1`, which is what the entrypoint keys off.
 
@@ -230,10 +287,33 @@ that: without `--cap-add=all`, `newuidmap` fails and no image that drops privile
 added to the *outer* container — the one Claude runs in — and they are real capabilities in that user namespace, not on
 the host.
 
+**It also breaks Claude's own sandbox, and the entrypoint is where that conflict is resolved.** With the capability set
+granted, bubblewrap refuses to run anything at all — not only podman, a bare `echo` too:
+
+```
+bwrap: Unexpected capabilities but not setuid, old file caps config?
+```
+
+Measured directly, inside the container:
+
+```
+without --cap-add=all:   bwrap OK       CapEff: 0000000000000000
+with    --cap-add=all:   bwrap FAILS    CapEff: 000001ffffffffff
+```
+
+The entrypoint therefore drops every capability immediately before `exec claude`, with
+`setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all`; `setpriv` comes from util-linux and is already in the
+image, so this costs no new package. The podman service keeps its own capabilities, because it is started first and
+capabilities are per-process. Proven end to end: the service comes up, `CapEff` is zero afterwards, bubblewrap
+works, and the service still spawns containers. Nothing in this document anticipated the conflict, and it is the
+sharpest interaction the design has with the sandbox.
+
 **Narrowing it is unresolved and worth revisiting.** `--cap-add=setuid,setgid` alone changed nothing, even though
 `CAP_SETUID` and `CAP_SETGID` were already present in `CapBnd` before any `--cap-add`. Only the full set worked. Which
 additional capability is operative was **not** determined and is deliberately not guessed here. Moving from `all` to a
-named set would be a measurable improvement to the threat model and is the obvious follow-up.
+named set would be a measurable improvement to the threat model and is the obvious follow-up. It would **not** have
+removed the capability drop above: bubblewrap's check is *any* capability at all while not setuid, so any non-empty
+grant trips it.
 
 `--privileged` was also tried and also worked. It is **rejected**: it is strictly broader, additionally exposing host
 devices reachable by the invoking user, and it buys nothing that `--cap-add=all` does not.
@@ -241,15 +321,32 @@ devices reachable by the invoking user, and it buys nothing that `--cap-add=all`
 If `--no-sandbox` is used, `seccomp=unconfined` and `unmask=ALL` disappear and `--containers` will not work — the two
 flags are mutually exclusive in practice and the script should say so.
 
+`--containers` is refused with **host networking** for a different reason (commit `b3a3f29`). The service listens on an
+unauthenticated port, and the only thing keeping it private is the container having a network namespace of its own;
+`--network host` would put that listener on the host's loopback among every other process on the machine. See §5.8.
+
 ### 5.5 Compose
 
 Two candidates, and the choice interacts with the user's decision to remove docker:
 
-- **`podman-compose`** (Debian package, pure Python, talks to the socket). Consistent with a podman-only design, no
-  `docker` binary anywhere. A foreign repository whose `Makefile` calls `docker compose` will not work.
+- **`podman-compose`** (Debian package, pure Python). It does **not** talk to the socket: it `os.execlp`s the `podman`
+  CLI (`podman_compose.py:1480`), and reaches the service only because the CLI itself defaults `--remote` to true when
+  `CONTAINER_HOST` is set — `podman(1)` says so explicitly. Consistent with a podman-only design, no `docker` binary
+  anywhere. A foreign repository whose `Makefile` calls `docker compose` will not work.
 - **Docker Compose v2 plugin binary.** Restores `docker compose` for foreign code. Note the trap: the conventional
   plugin directory is `~/.docker/cli-plugins`, and `~/.docker` is on `sandbox.filesystem.denyRead` — so `DOCKER_CONFIG`
   must point elsewhere, and nothing belonging to this feature may live under `~/.docker`.
+
+**That indirection is a triage trap.** With `CONTAINER_HOST` unset there is no socket error at all: the CLI runs
+locally and dies with `newuidmap: write to uid_map failed: Operation not permitted` — the same string a too-narrow
+subuid range produces, and the same one a missing `--cap-add=all` produces (§9, S5). The message alone does not
+distinguish the three.
+
+**Compose works end to end**, measured in the shipped configuration: a project under `/workspace` comes up, its
+services resolve one another by name, and `podman-compose down` removes them. `down` prints the same
+`rootless netns: kill network process: permission denied` line that breaks Testcontainers teardown (§5.7), but exits
+**0** and completes the cleanup, so compose is unaffected in practice — the agents must be told not to read that line
+as a failure (S11).
 
 Recommendation: `podman-compose`, as the option consistent with the stated direction. Whether to additionally install
 `podman-docker` so that foreign `docker` invocations resolve is an open question (§10), not a decision taken here — it
@@ -257,15 +354,51 @@ reintroduces a `docker` binary into a design whose premise is removing docker.
 
 ### 5.6 Sandbox interaction
 
-Everything the agent runs — the build tool, the test process, the readiness polling — runs inside bubblewrap. Two things
-must survive it:
+Everything the agent runs — the build tool, the test process, the readiness polling — runs inside bubblewrap unless it
+is excluded from the sandbox. Two things had to survive it, and **neither does**:
 
-1. **The socket must be connectable.** Connecting to a unix socket requires write permission on the inode. If bubblewrap
-   does not expose `$XDG_RUNTIME_DIR/podman/podman.sock` writable, every client reports *"Could not find a valid Docker
-   environment"*. Whether `settings.json`'s `sandbox.filesystem` can express a write allowance — the current file uses
-   only `allowRead`/`denyRead` — **needs checking against the installed Claude Code version**.
-2. **Loopback must be reachable.** Published ports bind on the claude container's loopback; the test process reaches
-   them through the sandbox's socat network filter.
+1. **The socket is not connectable from inside the sandbox.** Measured, from a sandboxed Bash call:
+
+   ```
+   dial unix /run/user/1001/podman/podman.sock: socket: operation not permitted
+   ```
+
+   Claude Code's Linux sandbox isolates the network namespace and blocks AF_UNIX at the seccomp layer. It is not a
+   permission question on the inode, which is what an earlier reading of this point assumed.
+2. **Loopback is not reachable either.** A sandboxed process cannot reach **any** TCP port on the *container's*
+   loopback, published ports included. It can bind and connect to its **own** loopback, and that is the measurement
+   that misleads: it looks like working loopback, and it is a different namespace.
+
+Four settings were measured against the first point and none of them bridges it:
+
+- `sandbox.filesystem.allowWrite` fixes a different and real problem — `chmod /run/user/1001/libpod: read-only file
+  system` — and then reveals the socket block underneath it. It is **not** in the shipped `settings.json`: with the
+  commands excluded, podman never runs under the sandbox's filesystem restrictions at all.
+- `sandbox.network.allowLocalBinding: true` — no effect.
+- `sandbox.enableWeakerNetworkIsolation: true` — no effect.
+- `sandbox.network.allowUnixSockets` exists on **macOS only**.
+
+**The agent therefore reaches the engine by running outside the sandbox, not by being let through it.** S9 (commit
+`a25bcf3`) uses `sandbox.excludedCommands`, whose entries run outside bubblewrap: `podman`, `podman-compose`, and the
+test runners — Maven, Gradle, npm/yarn/pnpm, pytest/tox/nox. The runners are on the list because §1's use case is a
+foreign suite started by `mvn`, `gradle` or `npm test`, and it is the JVM or node process they start that talks to the
+engine, not the shell command itself.
+
+Excluded commands are **not** auto-approved by `autoAllowBashIfSandboxed`, which only auto-approves commands that *are*
+sandboxed, so they need matching `permissions.allow` entries; S9 added `Bash(podman *)` and `Bash(podman-compose *)`.
+
+**What exclusion costs, measured rather than assumed:**
+
+| Probe                                      | Sandboxed                | Excluded      |
+|--------------------------------------------|--------------------------|---------------|
+| read `~/.claude/.credentials.json`         | **succeeds** (508 bytes) | succeeds      |
+| write to `$HOME` outside `/workspace`      | blocked, read-only       | **succeeds**  |
+
+Exclusion does not widen credential exposure: the sandbox never confined `~/.claude`, which §8 already records. What is
+lost is filesystem write confinement outside `/workspace`.
+
+**The limit of the mechanism.** A suite launched by a wrapper — `make test`, `./scripts/test.sh` — stays sandboxed and
+will not reach the engine, because covering it would mean excluding `bash` or `make`, which is the sandbox itself.
 
 One consequence cuts the other way and belongs in the threat model: because the service runs outside bubblewrap, **image
 pulls are not seen by the sandbox's network filter at all.** The agent can pull any image from any registry the
@@ -284,30 +417,86 @@ sandbox. The spike refuted it directly. In a plain container shell, **with no bu
 Nested user namespace creation itself is permitted: `unshare -U -r id -u` printed `0`. The cause is **capabilities on
 the outer container**, and the fix is `--cap-add=all` there (§5.4) — not anything about the sandbox.
 
-**What remains genuinely unmeasured** is whether bubblewrap *also* blocks the local podman CLI once the capability
-problem is solved. That comparison — Appendix A step 7 — has not been run. It no longer decides whether the service
-exists, since §4 justifies that on the API, but it does decide whether the agent can usefully run `podman` locally as
-well as remotely. Once S5 and S7 have landed it is expressed as
-
-```
-./run-claude.sh --containers shell -lc 'podman info'          # outside bwrap
-./run-claude.sh --containers -p 'run: podman info'            # via the Bash tool, sandbox on
-```
+**The service is not the preferred path to the engine; it is the only one.** The question of Appendix A step 7 —
+whether bubblewrap also blocks the local podman CLI — is answered, and more sharply than it was put. With
+`--cap-add=all` in force bubblewrap blocks *everything* (§5.4). After the entrypoint's capability drop bubblewrap works,
+and it is then the local CLI that cannot: without capabilities `newuidmap` fails with
+`newuidmap: write to uid_map failed: Operation not permitted`. That is step 7's first reading — local fails, remote
+succeeds — arrived at by a different route than the step assumed. So `podman` on the excluded list works as a remote
+client and never as a local engine. The local CLI does still work from the `shell` escape hatch, which sits before the
+drop and deliberately keeps its capabilities, so `--containers shell` remains the diagnostic path.
 
 ### 5.7 Environment exported into the container
 
-`CONTAINER_HOST` and `DOCKER_HOST` pointing at the service socket. For Testcontainers, `TESTCONTAINERS_RYUK_DISABLED` or
-`TESTCONTAINERS_RYUK_PRIVILEGED` — Ryuk bind-mounts the socket into itself and is a known friction point under podman;
-which of the two is correct **needs verification**. Notably `TESTCONTAINERS_HOST_OVERRIDE` is *not* needed, which is
-precisely the difference between this design and the rejected one.
+`CONTAINER_HOST` and `DOCKER_HOST` pointing at `tcp://127.0.0.1:2375`, and for Testcontainers
+**`TESTCONTAINERS_RYUK_DISABLED=true`**.
+
+Ryuk is Testcontainers' reaper, and it reaches the engine by bind-mounting the Docker socket into itself. There is no
+socket to mount, so podman tries to create the path it was asked for and cannot. Measured against the shipped TCP
+configuration, a real suite failed before it started anything:
+
+```
+(HTTP code 500) making volume mountpoint for volume /var/run/docker.sock: mkdir /var/run/docker.sock: permission denied
+```
+
+With the reaper disabled the same suite proceeds. Appendix A step 8's proxy reading — Ryuk starting happily with a unix
+socket bind-mounted into it, which pointed at `TESTCONTAINERS_RYUK_PRIVILEGED=true` — is **superseded**: it was run
+against a transport this design no longer uses. Disabling the reaper is acceptable here because the engine itself is
+ephemeral: the service is a child of the claude container, every container it started dies with it, and nothing survives
+the session for a reaper to find. A durable or shared engine would owe this a second look.
+
+`TESTCONTAINERS_HOST_OVERRIDE` is *not* needed, which is precisely the difference between this design and the rejected
+one, and it is now measured rather than argued: a real suite started its container and connected to the mapped port
+from inside the container, reporting `TESTCONTAINERS-OK host=127.0.0.1 port=33287`.
+
+**Teardown is a known limitation, and it is not caused by anything in this design.** With the tests passed and the
+connection made, removing the container fails:
+
+```
+(HTTP code 500) removing container ... network: 1 error occurred:
+	* rootless netns: kill network process: permission denied
+```
+
+Testcontainers surfaces that as an exception, so the suite exits 1. The error reproduces identically with and without
+the capability drop of §5.4 (`rc=1` both ways), so it is inherent to nested rootless podman on this host; the cause is
+not established here and is deliberately not guessed. The measured boundary is: **compose works end to end;
+Testcontainers starts and connects but fails at teardown.** `podman-compose down` hits the same error, exits 0 and
+completes the cleanup (§5.5).
 
 ### 5.8 Entrypoint
 
 When `CLAUDE_TOOLS_CONTAINERS=1`: create `$XDG_RUNTIME_DIR`, start `podman system service --time=0
-unix://$XDG_RUNTIME_DIR/podman/podman.sock` in the background, poll for the socket with a bounded timeout, then
-`exec claude` as today. On failure it must print an explicit diagnostic naming the likely cause rather than failing
-silently or aborting the container — Claude itself is still usable without it, and a silent failure produces exactly the
-confusing error this design is meant to avoid.
+tcp://127.0.0.1:2375` in the background, poll the port for a connection with a bounded timeout, then `exec claude` as
+today. On failure it must print an explicit diagnostic naming the likely cause rather than failing silently or aborting
+the container — Claude itself is still usable without it, and a silent failure produces exactly the confusing error this
+design is meant to avoid.
+
+**The API is served over TCP rather than over a unix socket** (commit `0da742b`), because no sandboxed process can
+connect to a unix socket at all (§5.6). `XDG_RUNTIME_DIR` did not go with the socket: rootless podman keeps its runtime
+state under it — the storage runroot, the pause process — however the API is served. What has gone is the socket file
+and the directory that had to exist beneath it.
+
+**A fixed port is safe here, and the reason is the network namespace.** `run-claude.sh` does not pass `--network=host`,
+so every claude container has its own loopback. Measured: two concurrent sessions each bound `127.0.0.1:2375` at the
+same time, neither saw the other's service, and nothing was bound on the host at all. There is no collision to arbitrate
+and no port to allocate. `--network host` is the one mode that would end that, which is why `run-claude.sh` refuses it
+under `--containers` (§5.4). 2375 is the conventional Docker API port, chosen to be recognisable on sight in a
+diagnostic.
+
+**The cost is a lost permission gate, and it belongs in the threat model.** The unix socket was `srw------- claude
+claude`: the filesystem confined it to one user. A port has no such gate, so anything in the container's network
+namespace can drive the engine — including a container the agent starts with the inner podman's own `--network host`.
+Inside this container that is a modest change against a threat model that already accepts more (§8), but it is a real
+difference rather than a wash.
+
+**Then the capability drop of §5.4**, immediately before `exec claude` and after the `shell`/`bash`/`sh` hatch, so that
+the debugging shell keeps its privilege while Claude does not. All three capability sets have to go: ambient is how the
+capabilities arrive and clearing it is what empties the permitted and effective sets across the exec, inheritable is the
+other route across it, and the bounding set is what stops anything downstream regaining them. The invocation is tried
+against `true` first and abandoned if that fails, because clearing the bounding set needs `CAP_SETPCAP`: on the ordinary
+run, without `--containers`, there is nothing to drop and `setpriv` exits 127 with
+`setpriv: apply bounding set: Operation not permitted`. Aborting there would stop Claude starting at all on the commoner
+of the two paths.
 
 ### 5.9 Identity and file ownership under nesting
 
@@ -332,6 +521,11 @@ Nesting preserves that property. With a host user of uid 1000:
 | `0` (root)                       | `1000`, the claude user  | `1000`, the user  | owned by the user — the normal case  |
 | non-root, e.g. `999`             | a mapped subuid          | a host subuid     | owned by an id the user cannot use   |
 
+**Both rows are confirmed by observation**, not by reasoning: the ownership run of Appendix A step 6 was carried out on
+the user's host (uid 1001, gid 1003). The file written by the root container appeared in the workspace owned by
+`1001:1003`, the invoking user's own uid and gid; the file the uid-999 container tried to write was never created — the
+`DENIED` outcome, which is the `Permission denied` half of the second row.
+
 So a container running **as root** is the well-behaved case, and a container that **drops privileges** is the one that
 strands files. The second case has a mirror-image failure that shows up first in practice: a non-root process sees a
 workspace directory owned by the user as owned by `root`, and fails with `Permission denied` before it writes anything.
@@ -348,7 +542,8 @@ Mitigations, in order of preference:
 - Prefer **named volumes** over bind mounts into `/workspace` for anything such a container writes (database data
   directories, broker state). Read-only bind mounts of configuration are unaffected either way.
 - Recovery on the host for files already stranded: `podman unshare rm -rf <path>`, which enters the user's namespace
-  where those subuids are mapped. **Verify** on a real host before putting it in the README.
+  where those subuids are mapped. Still **unverified** — the ownership run produced no stranded file to test it on,
+  because the uid-999 write was denied before it created anything.
 - A blanket `userns = "keep-id"` in `containers.conf` would fix the second row globally but reintroduces the
   single-mapping problem for images that genuinely need a second id. Not proposed; recorded so the trade-off is on the
   record.
@@ -389,9 +584,9 @@ reachable from the test process — which is exactly §5.9's claim that `localho
 **`--userns=keep-id` is exonerated.** The pre-capability failure was byte-identical with and without it. It stays, since
 it is what preserves sane file ownership, and it costs nothing here.
 
-**Still unmeasured, and deliberately not inferred from the above:** the §5.9 ownership experiment (root versus uid-999
-writes into the `/workspace` bind mount, read back with `ls -ln` from the host); the bubblewrap comparison of §5.6; the
-Ryuk variable of §5.7; and MinIO's default user.
+**Measured since, during implementation, and recorded in the sections that own them:** the §5.9 ownership experiment
+(Appendix A step 6) and the Ryuk proxy of §5.7 (step 8) were both run, and §5.6's bubblewrap comparison was answered by
+the capability conflict of §5.4. **Still unmeasured:** MinIO's default user (§10 question 5).
 
 ## 6. Failure handling and edge cases
 
@@ -400,20 +595,22 @@ Ryuk variable of §5.7; and MinIO's default user.
 | `--containers` not given                                     | no service, no devices, no volume                      | agent reports the capability is off, not that the repo is broken   |
 | `--containers` given together with `--no-sandbox`            | script rejects the combination                          | explicit error naming the conflict                                 |
 | Inner podman cannot map subuids                              | service fails at start; entrypoint logs and continues   | named diagnostic at container start, Claude still usable           |
-| `/dev/fuse` unavailable on the host                          | fall back to the `vfs` storage driver                   | slower first start, more disk; documented in the README            |
-| `/dev/net/tun` unavailable                                   | inner rootless networking fails                         | containers start but no port publishing; diagnostic in the log     |
-| Socket not connectable from inside bubblewrap                | clients cannot find a Docker environment                | *"Could not find a valid Docker environment"*                      |
-| Loopback filtered by the sandbox network filter              | readiness polling never succeeds                        | *"Timed out waiting for container port to open"*                   |
+| `/dev/fuse` unavailable on the host                          | outer `podman run` fails before the container starts    | podman error names the device; `vfs` is manual, never automatic    |
+| `/dev/net/tun` unavailable on the host                       | outer `podman run` fails the same way                   | same; `slirp4netns` is no fallback — it needs the device too       |
+| Engine command not on `sandbox.excludedCommands`             | runs sandboxed; reaches neither the service nor a port   | *"Could not find a valid Docker environment"*                      |
+| Suite launched by a wrapper (`make test`, `./scripts/test.sh`)| stays sandboxed; exclusion cannot cover it              | same message; the limit of the mechanism, §5.6                     |
 | First pull of a large image inside the startup timeout       | wait strategy expires before the service is ready       | same timeout message as above — indistinguishable without triage   |
 | Service alive but the image genuinely slow (rabbitmq ~10-20s)| wait strategy eventually succeeds                       | slow first run, then fast                                          |
 | Spawned container runs as root and writes to `/workspace`    | ids map back to the invoking user                       | files owned by the user, exactly as today                          |
 | Spawned container drops to a non-root uid and writes there   | `Permission denied`, or files owned by a host subuid    | fixture fails, or files the user cannot delete                     |
+| Testcontainers suite tears down its containers               | container removal fails under nested rootless podman     | *"rootless netns: kill network process"*; suite exits 1 (§5.7)     |
+| `podman-compose down` after a compose run                    | same error on stderr, exit 0, cleanup completes          | nothing to do; the agents are told not to read it as a failure     |
 | Agent leaves containers running                              | they die with the claude container (`--rm`)             | no host residue; the store volume keeps images only                |
 | Store volume grows unbounded                                 | not reclaimed automatically                             | documented `podman volume rm claude-tools-containers` in README    |
 
-The middle four rows all surface as one of two messages. The README must carry a triage note distinguishing them:
-socket unreachable → *"could not find a valid Docker environment"*; everything else → *"timed out"*, separated by
-whether `podman --remote ps` lists the container at all, and whether its log shows the service listening.
+Four rows in the middle all surface as one of two messages. The README must carry a triage note distinguishing them: a
+command that ran sandboxed → *"could not find a valid Docker environment"*; everything else → *"timed out"*, separated
+by whether `podman --remote ps` lists the container at all, and whether its log shows the service listening.
 
 ## 7. Alternatives considered
 
@@ -456,7 +653,9 @@ is on the record.
   anticipated: the design was drafted believing `--containers` needed no security option beyond those already passed
   for Claude's sandbox, and the spike refuted that. The capabilities apply inside the container's user namespace, not
   on the host, so they do not confer host privilege — but the outer container is materially less confined than before,
-  and `run-claude.sh` grants this only under `--containers`. `--privileged` was rejected as strictly broader.
+  and `run-claude.sh` grants this only under `--containers`. `--privileged` was rejected as strictly broader. The
+  capabilities exist for the podman service, not for Claude: the entrypoint drops all of them before `exec claude`
+  (§5.4), so Claude and everything it runs hold none, and only the `shell` escape hatch keeps them.
   Which single capability is actually required is **unknown**; narrowing `all` to a named set is the clearest available
   improvement to this threat model and should be treated as a follow-up rather than forgotten.
 - The README's *"Anything requiring root has to go into the `Dockerfile`"* survives literally — there is still no `sudo`
@@ -466,6 +665,16 @@ is on the record.
   credentials in the mounted `~/.claude`, and it has network. The deny entries for `~/.ssh` and friends constrain
   Claude's own tools, not a process the agent starts in a container. Bubblewrap still protects against *accidental*
   access — a stray `cat` in a Bash call — which is not nothing, but it no longer protects against deliberate access.
+- **The engine API is served on an unauthenticated TCP port**, where it was a `srw------- claude claude` unix socket
+  (§5.8). The filesystem gate is gone, so anything in the container's network namespace can drive the engine —
+  including a container the agent starts with the inner podman's own `--network host`. What keeps that port off the
+  host is the claude container having a network namespace of its own, which is why `--containers` refuses host
+  networking.
+- **The commands that reach the engine run outside Claude's sandbox** — `podman`, `podman-compose` and the test
+  runners, through `sandbox.excludedCommands` (§5.6). Measured, that costs less than it sounds: reading
+  `~/.claude/.credentials.json` succeeds sandboxed just as it does excluded, so exclusion widens no credential
+  exposure. What is lost is filesystem write confinement outside `/workspace`, which a sandboxed command has and an
+  excluded one does not.
 - Image pulls bypass the sandbox's network filter entirely (§5.6).
 - `~/.ssh` is no longer mounted at all (`1eabbb5`), so the largest instance of this exposure is already closed. The
   `deny` entries for it remain in `settings.json` as defence in depth. `~/.gitconfig` is still mounted read-only and is
@@ -485,11 +694,22 @@ That is the practical cost of this design and belongs in the README.
 `--engine docker`; they must install podman and rebuild, since a docker-built image is not in podman's store. The README
 must say so. `--containers` defaults to off, so existing invocations are otherwise unaffected.
 
-**Operational cost.** Image growth of roughly 100 MB — measured once, but against a bookworm base, so indicative only
-and pending re-measurement on trixie. A named volume that grows with every image the
-agent pulls and is never reclaimed automatically. First-run latency dominated by pulls. No cgroup delegation inside the
-container, so spawned containers run without resource limits — a runaway test fixture is bounded only by the claude
-container's own limits.
+**`build.sh` has no root guard, while `run-claude.sh` does.** S3 makes `run-claude.sh` refuse to run as root; `build.sh`
+has no equivalent check, so `sudo ./build.sh` succeeds and writes the image into root's store, which the root-refusing
+`run-claude.sh` will never read — the same broken combination §5.1 rules out for a docker-built image. Left as it
+stands, by decision; recorded as a known gap rather than a task.
+
+**A pre-existing image defect, unrelated to this design.** In a **login** shell — which is what
+`./run-claude.sh shell -lc '…'` gives, and what the README's own tooling example uses — Debian's `/etc/profile` resets
+`PATH`, and `~/.claude-tools-env.sh` re-prepends `$PYENV_ROOT/bin` but not `$PYENV_ROOT/shims`. Measured: `python3` is
+the system 3.13.5 in a login shell and pyenv's 3.12.7 in a non-login one, while section 7 of the `Dockerfile` comments
+that the shims are already on `PATH`. It predates this work and is being fixed in a separate commit; recorded so the
+discrepancy is on the record.
+
+**Operational cost.** Image growth of **180 MB**, measured on trixie: 1.88 GB to 2.06 GB. A named volume that grows
+with every image the agent pulls and is never reclaimed automatically, shared between concurrent sessions (§5.3).
+First-run latency dominated by pulls. No cgroup delegation inside the container, so spawned containers run without
+resource limits — a runaway test fixture is bounded only by the claude container's own limits.
 
 **Testability.** There is no test suite in this repository and this change does not create one. Verification is manual,
 which is a real weakness; §5.6 and the spike exist to make it repeatable rather than ad hoc.
@@ -502,20 +722,24 @@ which is a real weakness; §5.6 and the spike exist to make it repeatable rather
 | S2  | Drop docker from the build script            | `build.sh`                             | `Remove the docker engine option from build.sh`    | —              | `--engine`/`CONTAINER_ENGINE`/`AUTO_ENGINE` gone; missing podman errors    |
 | S3  | Drop docker, require rootless podman         | `run-claude.sh`                        | `Remove the docker engine option from run-claude.sh`| —             | engine branches gone; `unmask=ALL` unconditional; rootful refused          |
 | S4  | Document the podman-only engine              | `README.md`                            | `Document the podman-only engine in the README`    | S2, S3         | sandbox table rewritten for podman; migration note for docker users        |
-| S5  | Install podman and its config in the image   | `Dockerfile`                           | `Install rootless podman in the image`             | S1             | image builds; `podman info` succeeds in `shell`; options commented in file |
-| S6  | Start the API service from the entrypoint    | `docker-entrypoint.sh`                 | `Start the podman API service from the entrypoint` | S5             | socket exists; `podman --remote info` succeeds; failure logs a diagnostic  |
+| S5  | Install podman and its config in the image   | `Dockerfile`                           | `Install rootless podman in the image`             | S1             | image builds; subuid ranges computed from build args; options commented in file |
+| S6  | Start the API service from the entrypoint    | `docker-entrypoint.sh`                 | `Start the podman API service from the entrypoint` | S5             | service listening; `podman --remote info` succeeds; failure logs a diagnostic|
 | S7  | Add the opt-in flag                          | `run-claude.sh`                        | `Add --containers to run-claude.sh`                | S5             | flag adds `--cap-add=all`, both devices, volume, env; `--no-sandbox` refused|
-| S8  | Add compose support                          | `Dockerfile`                           | `Add compose support inside the image`             | S5             | a compose file under `/workspace` comes up and down from `shell`           |
-| S9  | Open the socket and loopback to the sandbox  | `settings.json`                        | `Allow the podman socket through Claude's sandbox` | S6, S7         | a Testcontainers run started by the agent reaches the service and the port |
+| S8  | Add compose support                          | `Dockerfile`                           | `Add compose support inside the image`             | S5, S6, S7     | a compose file under `/workspace` comes up and down from `--containers shell` |
+| S8a | Drop capabilities before starting claude **(done)** | `docker-entrypoint.sh`           | `Drop capabilities before starting claude`         | S7             | done — `13d5c67`; bubblewrap runs under `--cap-add=all`, `CapEff` zero      |
+| S8b | Serve the API over loopback TCP **(done)**   | `docker-entrypoint.sh`                 | `Serve the podman API over loopback TCP`           | S6             | done — `0da742b`; service on `tcp://127.0.0.1:2375`, env points at it       |
+| S8c | Refuse host networking under `--containers` **(done)** | `run-claude.sh`              | `Refuse --containers with host networking`         | S8b            | done — `b3a3f29`; `--containers --network host` errors out                 |
+| S9  | Let the agent reach the engine               | `settings.json`                        | `Allow the agent to reach the container engine`    | S8b            | done — `a25bcf3`; engine commands and test runners excluded from the sandbox|
 | S10 | Document the capability and its threat model | `README.md`                            | `Document container spawning and its threat model` | S6, S7, S8, S9 | `--cap-add=all` concession stated; triage note; volume cleanup documented  |
 | S11 | Teach the three agents the capability        | `agents/` — three prompts              | `Teach the agents to use podman`                   | S6, S7         | three prompts updated; guidance tailored per role; README note added       |
 | S12 | Version bump                                 | `Version.txt`                          | `v1.2.0`                                           | S10, S11       | version reflects the released change                                       |
 
-**Parallelization:** Wave 1: S1 *(done)*, S2, S3 · Wave 2: S4 (needs S2, S3), S5 (needs S1) · Wave 3: S6, S7, S8
-(need S5) · Wave 4: S9 (needs S6, S7) · Wave 5: S10, S11 (independent of each other) · Wave 6: S12
+**Parallelization:** Wave 1: S1 *(done)*, S2, S3 · Wave 2: S4 (needs S2, S3), S5 (needs S1) · Wave 3: S6, S7 (need
+S5) · Wave 4: S8, then S8a, S8b, S8c and S9 in that order, each needing the one before · Wave 5: S10, S11 (independent
+of each other) · Wave 6: S12
 
 With S1 landed, the two chains can now run fully in parallel: the podman-only chain (S2 → S3 → S4) and the spawning
-chain (S5 → S6/S7/S8 → …) share no files and no ordering.
+chain (S5 → S6/S7 → S8 → …) share no files and no ordering.
 
 **Step detail**
 
@@ -528,15 +752,29 @@ chain (S5 → S6/S7/S8 → …) share no files and no ordering.
 - **S5** carries the commentary requirement: each package and each config choice documented in the `Dockerfile`, in the
   style of its existing numbered sections. The `/etc/subuid` and `/etc/subgid` entries must be **computed** from the
   build-arg uid and gid, following the arithmetic in Appendix A step 3 — not hardcoded to the values §5.2 records.
+  **`podman info` is not an S5 criterion.** It needs `--cap-add=all`, which S7 adds; run at S5 it fails with
+  `newuidmap: write to uid_map failed: Operation not permitted`. S7 is the first step at which it is verifiable, from
+  the `--containers shell` hatch.
 - **S7** must add `--cap-add=all` alongside the two devices. This is a security concession, so the flag's help text and
   the comment beside it say what it buys and what it costs, in the manner of the existing sandbox block.
-- **S9** may turn out to need nothing if the sandbox already permits both; the step then records that, and is still a
-  commit only if something changes.
+- **S8** is listed after S6 and S7 rather than beside them: its criterion is a compose project actually coming up, which
+  needs the service (S6) and the capability and devices (S7) as well as the packages (S5).
+- **S8a, S8b and S8c were not in the original plan**, and each is forced by a measurement the plan had no way to
+  anticipate: the capability grant of S7 breaks bubblewrap and has to be dropped before `exec claude` (§5.4); no
+  sandboxed process can connect to a unix socket, so the API moved to loopback TCP (§5.6, §5.8); and an unauthenticated
+  port is only private while the container has a network namespace of its own, so host networking had to be refused
+  (§5.8). They are listed here because a plan that omits three landed commits misleads the next reader.
+- **S9** turned out to need the opposite of what it was scoped for. No sandbox setting opens the socket or the container
+  loopback (§5.6), so the step shipped as `sandbox.excludedCommands` — the engine commands and the test runners running
+  *outside* the sandbox — plus the `permissions.allow` entries they need because `autoAllowBashIfSandboxed` does not
+  cover them.
 - **S11** touches `agents/code-reviewer.md`, `agents/developer.md` and `agents/senior-dev.md`. The **shared substance**
   is identical in all three: podman is the only engine and `docker` does not exist; a repository's compose file is
   brought up from its own directory under `/workspace` and torn down afterwards; containers run as root against a
   workspace bind mount, or non-root against named volumes (§5.9); and the two-timeout triage of §6, so that a sandbox
-  or pull problem is never reported as a defect in the code under test.
+  or pull problem is never reported as a defect in the code under test. It also has to carry the two teardown readings:
+  `podman-compose down` prints `rootless netns: kill network process: permission denied` and still succeeds, so that
+  line is not a failure (§5.5), while a Testcontainers suite fails at teardown for the same reason and exits 1 (§5.7).
 
   **Kept as three tailored copies, not one shared file, and the reason is mechanical.** `agents/README.md` documents the
   directory format for a human reader; it is not loaded into any agent's context — Claude Code reads the agent `.md`
@@ -559,18 +797,16 @@ chain (S5 → S6/S7/S8 → …) share no files and no ordering.
 | # | Question                                                                                      | Who answers | Blocks |
 |---|-----------------------------------------------------------------------------------------------|-------------|--------|
 | 1 | Which capability does `--cap-add=all` actually supply? `setuid,setgid` alone was not enough      | measurement | none   |
-| 2 | Does bubblewrap block the local podman CLI once capabilities are right? (Appendix A step 7)      | measurement | none   |
-| 3 | Does `sandbox.filesystem` support a write allowance for the socket path in the installed build?  | measurement | S9     |
-| 4 | `TESTCONTAINERS_RYUK_DISABLED` or `TESTCONTAINERS_RYUK_PRIVILEGED` under nested rootless podman?  | measurement | S9     |
 | 5 | Does the MinIO image in use still default to root? `podman image inspect --format '{{.Config.User}}'` | measurement | S11 |
-| 6 | The §5.9 ownership experiment — root versus uid-999 writes, read back with `ls -ln` on the host  | measurement | none   |
 
-All decisions have been taken; what remains are measurements. **Question 1 is the one worth chasing**: narrowing
-`--cap-add=all` to a named set is the clearest available improvement to the threat model, and it is not on the critical
-path. Question 6 would confirm or refute the table in §5.9, which currently rests on reasoning rather than observation.
-Nothing here blocks S2 through S8.
+Questions 2, 3, 4 and 6 have been answered and moved to the list below; the numbering keeps its gaps so that the
+references from Appendix A stay valid. **Question 1 is still the one worth chasing**: narrowing `--cap-add=all` to a
+named set is the clearest available improvement to the threat model, and it is not on the critical path. It would
+**not** have avoided the capability drop of §5.4 — bubblewrap's check is *any* capability at all while not setuid, so
+any non-empty grant trips it, and the drop would have been required either way. Nothing open blocks a step: S9 has
+landed, and question 5 affects only the wording of the agent guidance in S11.
 
-**Resolved during review, recorded for traceability:**
+**Resolved during review and implementation, recorded for traceability:**
 
 - `agents/code-reviewer.md`, `agents/developer.md` and `agents/senior-dev.md` are all in scope (S11). `senior-dev`
   was added because it takes a small task end to end and hits the same wall when a task needs a container to verify
@@ -586,14 +822,36 @@ Nothing here blocks S2 through S8.
   day **succeeded**: nested rootless podman works, `postgres:16` starts and its published port is reachable, and
   `--cap-add=all` is required. Full record in §5.10.
 - The Debian 13 package versions and `max_user_namespaces` are confirmed; the image builds on trixie after `4e35c5a`.
+  Image growth is measured on trixie at **180 MB** (1.88 GB to 2.06 GB), closing the last item of §5.2.
+- **Question 2 — bubblewrap and the local podman CLI — is answered, and more sharply than it was asked.** With
+  `--cap-add=all` in force bubblewrap blocks everything; after the entrypoint's capability drop bubblewrap works and the
+  local CLI is the thing that cannot, because `newuidmap` has no capabilities left. The service is therefore the only
+  interface to the engine — Appendix A step 7's first reading — while the local CLI still works from the `shell` hatch,
+  which keeps its capabilities. §5.4 and §5.6. This says nothing about whether a sandboxed process can reach the
+  service; that is question 3, resolved separately below.
+- **Question 3 is answered, and the answer is that no sandbox setting bridges the gap.** `sandbox.filesystem` does
+  support a write allowance — `allowWrite` — and it fixes a real but different problem
+  (`chmod /run/user/1001/libpod: read-only file system`), revealing the socket block underneath. Claude Code's Linux
+  sandbox isolates the network namespace and blocks AF_UNIX at the seccomp layer; `allowLocalBinding` and
+  `enableWeakerNetworkIsolation` have no effect, and `allowUnixSockets` is macOS-only. S9 therefore shipped as
+  `sandbox.excludedCommands`, and `allowWrite` is not in the settings file at all. §5.6.
+- **Question 4 is answered: `TESTCONTAINERS_RYUK_DISABLED=true`.** Appendix A step 8's proxy pointed the other way —
+  Ryuk started happily with a unix socket bind-mounted into it — but it was run against a transport this design no
+  longer uses, and it is superseded. Measured against the shipped TCP service, a real suite fails before it starts
+  anything with `mkdir /var/run/docker.sock: permission denied`, because Ryuk bind-mounts the socket path. Disabling
+  the reaper is acceptable because the engine is ephemeral and dies with the claude container. §5.7.
+- **Question 6 is answered: the §5.9 table is confirmed by observation.** The root container's file appeared owned by
+  `1001:1003`, the invoking user's own uid and gid; the uid-999 container's file was never created — the `DENIED`
+  outcome. Both rows hold, and the recovery command for stranded files remains unverified because no file was stranded.
+  §5.9.
 - The `~/.ssh` mount has been **removed** in commit `1eabbb5`, in a separate change while this analysis was being
   written. `~/.gitconfig` remains mounted read-only by the user's choice. Nothing in this plan depends on either.
 
 ## Appendix A — Spike procedure (S1)
 
-**Status: run, and successful.** The results are in §5.10. This procedure is kept for two reasons: steps 6 to 8 were
-never reached and remain the outstanding measurements of §10, and steps 1 to 5 are the reproduction anyone needs when
-S5 and S7 are implemented.
+**Status: run, and successful.** The results are in §5.10. Steps 6 and 8 were run later, during implementation, and
+step 7's question was answered by the capability conflict of §5.4 — see §10. The procedure is kept because steps 1 to 5
+are the reproduction anyone needs when S5 and S7 are revisited.
 
 Two hard-won lessons are baked into the form below, and both cost a wasted run:
 
@@ -726,7 +984,7 @@ podman images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep -E 'claude-to
 
 Expected: the name after `I am` is **identical** to the name at the start of both files, and podman reports 5.4.x. If
 the names differ, `SPIKE_USER` is wrong and every reading below is a false negative. **Record the size difference** —
-that is the image-growth figure §5.2 still needs on a trixie base.
+that is the image-growth figure of §5.2, measured on trixie at +180 MB.
 
 ### Step 5 — the working configuration
 
@@ -774,9 +1032,9 @@ and produced a false negative:
    Expect `trixie` and podman 5.4.x, and check the `localhost/` prefix.
 3. **Range outside the outer mapping**, or `--cap-add=all` omitted. Compare `/etc/subuid` against step 3's `uid_map`.
 
-### Step 6 — ownership *(outstanding — §10 question 6)*
+### Step 6 — ownership *(run — §10 question 6 answered)*
 
-Validates the table in §5.9, which currently rests on reasoning rather than observation. In the spike shell:
+Validates the table in §5.9. In the spike shell:
 
 ```
 mkdir -p /workspace/spike-data
@@ -792,7 +1050,10 @@ Expected: `as-root` owned by your own uid and gid; `as-999` either absent with `
 subuid you cannot manage. Anything else refutes §5.9 and that section must be rewritten. Clean up with
 `podman unshare rm -rf spike-data`, recording whether it was needed and whether it worked.
 
-### Step 7 — the bubblewrap comparison *(outstanding — §10 question 2)*
+Observed: `as-root` owned by `1001:1003`, the invoking user's own uid and gid; `as-999` absent — the `DENIED` outcome,
+so `podman unshare` was not needed and the recovery command is still unverified. §5.9 holds.
+
+### Step 7 — the bubblewrap comparison *(answered — §10 question 2)*
 
 This no longer decides whether the service exists — §4 justifies that on the API — but it decides whether the agent can
 usefully run `podman` locally as well as remotely. In the spike shell:
@@ -810,14 +1071,21 @@ claude -p 'Run the shell command `podman --remote info --format {{.Store.GraphDr
 
 Readings:
 
-- **Local fails, remote succeeds** — the socket is what the agent must use. S6 as designed, and §10 question 3 is
-  answered *yes, the sandbox permits the socket*.
+- **Local fails, remote succeeds** — the service is what the agent must use. S6 as designed. Whether the sandbox
+  permits a client to reach that service is a separate question, and does not follow from this reading; see the outcome
+  below and §10 question 3.
 - **Both succeed** — bubblewrap blocks neither. The agent may use the CLI directly; the service still exists for
   Testcontainers.
 - **Both fail** — the sandbox blocks the socket too. §10 question 3 is answered *no* and S9 has real work; capture the
   exact error, since it determines whether `settings.json` can express the allowance at all.
 
-### Step 8 — Ryuk *(outstanding — §10 question 4)*
+Outcome: the first reading, though by a route the step did not anticipate — the local CLI fails because the entrypoint
+drops the capabilities `newuidmap` needs, and bubblewrap cannot run at all while they are held (§5.4, §5.6). The service
+is the only interface to the engine. Note that the unix socket above is the spike's transport, not the design's: the
+shipped service listens on `tcp://127.0.0.1:2375`, and neither transport is reachable from inside the sandbox, which is
+what §10 question 3 came to (§5.6).
+
+### Step 8 — Ryuk *(run — §10 question 4 answered)*
 
 A cheap proxy for a full Testcontainers run; Ryuk's distinguishing requirement is bind-mounting the socket into a
 container:
@@ -828,6 +1096,11 @@ podman run --rm -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/docker.sock" do
 
 If it starts and logs that it is listening, §5.7 uses `TESTCONTAINERS_RYUK_PRIVILEGED=true`; if it fails,
 `TESTCONTAINERS_RYUK_DISABLED=true`. A proxy, not the real thing — note it as such.
+
+Observed: it started and logged `level=INFO msg=Started address=[::]:8080` and `client processing started`. That
+reading is **superseded**, because the socket it was given no longer exists: against the shipped TCP service a real
+suite fails with `mkdir /var/run/docker.sock: permission denied`, and §5.7 uses `TESTCONTAINERS_RYUK_DISABLED=true`.
+The step's own caveat — a proxy, not the real thing — is why it was worth re-measuring.
 
 ### Step 9 — tidy up and record
 
