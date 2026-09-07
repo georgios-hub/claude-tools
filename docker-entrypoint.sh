@@ -165,6 +165,33 @@ if [ "${CLAUDE_TOOLS_CONTAINERS:-}" = "1" ]; then
         # to read, so on failure they stay unset.
         export CONTAINER_HOST="$PODMAN_SERVICE_ADDR"
         export DOCKER_HOST="$PODMAN_SERVICE_ADDR"
+
+        # The third variable is what serving the API over TCP costs a client,
+        # and it is measured rather than pre-empted. Ryuk is Testcontainers'
+        # reaper -- a sidecar that removes the containers a test process left
+        # behind when it died -- and it reaches the engine by bind-mounting the
+        # Docker socket into itself. There is no socket here, so podman tries to
+        # create the path it was asked to mount and cannot, and a real suite run
+        # in this container failed before it started anything:
+        #
+        #   (HTTP code 500) server error - make cli opts(): making volume
+        #   mountpoint for volume /var/run/docker.sock: mkdir
+        #   /var/run/docker.sock: permission denied
+        #
+        # With the reaper disabled the same suite got past that and reported its
+        # container up on 127.0.0.1 with a mapped port.
+        #
+        # Turning a cleanup mechanism off deserves more than "it unblocked the
+        # error", so: what makes it acceptable is this design specifically, not
+        # Ryuk being unimportant. Ryuk reaps containers orphaned by a test
+        # process that outlived its cleanup; here the engine itself is
+        # ephemeral. The service is a child of this container, every container
+        # it started dies with it, and nothing survives the session for a reaper
+        # to find. A durable or shared engine would owe this a second look.
+        #
+        # Set on this branch only, like the two above: a session with no working
+        # engine should not carry a variable implying one.
+        export TESTCONTAINERS_RYUK_DISABLED=true
     else
         # Not fatal, deliberately. Claude is perfectly usable without an engine,
         # and a container that refused to start would be a far worse outcome
