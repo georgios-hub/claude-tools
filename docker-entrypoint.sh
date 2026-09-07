@@ -31,35 +31,67 @@ mkdir -p "$HOME/.claude" 2>/dev/null || true
 # volume the inner podman needs. Unset, or any other value, and nothing below
 # happens and this image behaves exactly as it did before.
 if [ "${CLAUDE_TOOLS_CONTAINERS:-}" = "1" ]; then
-    # `podman system service` serves the Docker-compatible API over a unix
-    # socket, and that socket -- never the CLI -- is what Testcontainers,
-    # dockerode, docker-py and the compose implementations actually talk to. It
-    # therefore has to exist before the agent runs anything, which is why it is
-    # started here rather than left to the agent. --time=0 keeps it alive when
-    # idle; without it the service exits a few seconds after the last request.
+    # `podman system service` serves the Docker-compatible API, and that API --
+    # never the CLI -- is what Testcontainers, dockerode, docker-py and the
+    # compose implementations actually talk to. It therefore has to be up before
+    # the agent runs anything, which is why it is started here rather than left
+    # to the agent. --time=0 keeps it alive when idle; without it the service
+    # exits a few seconds after the last request.
     #
-    # Rootless podman keeps its runtime state under XDG_RUNTIME_DIR and wants
-    # the directory to be the user's own and unreachable by anyone else -- the
-    # socket lives in it, and whoever can reach the socket drives the engine.
-    # Section 8 of the Dockerfile creates it and podman's tmpcopyup /run carries
-    # it into the running container, but recreating it costs nothing and this
-    # does not have to depend on that.
+    # It is served over loopback TCP and not over a unix socket, and that is
+    # measured rather than preferred. Claude's Bash tool runs inside bubblewrap,
+    # and Claude Code's Linux sandbox refuses AF_UNIX outright at the seccomp
+    # layer -- from a sandboxed Bash call every client got:
     #
-    # Both levels are created, and the socket's own directory is the one that
-    # bites: the service binds the socket, and bind(2) does not create parent
-    # directories, so without $XDG_RUNTIME_DIR/podman the service dies at once
-    # with `bind: no such file or directory`. It is derived from the socket path
-    # rather than spelled out again, so the two cannot drift apart. Mode 0700 on
-    # it is redundant while its parent is 0700 -- nobody else can traverse there
-    # -- but it keeps the guarantee off a single directory's mode, and that
-    # parent is created by the Dockerfile and carried in by a tmpcopyup mount
-    # rather than by anything here.
+    #   dial unix /run/user/1001/podman/podman.sock: socket: operation not permitted
+    #
+    # That is a blocked socket(2) and not a permission on a file: allowing
+    # sandbox.filesystem.allowWrite over the runtime directory cleared the
+    # `chmod ... read-only file system` error that came before it, and uncovered
+    # this one underneath. No settings.json lifts it either --
+    # sandbox.network.allowUnixSockets exists on macOS only. Loopback TCP does
+    # pass the sandbox, and the whole chain was measured through it from inside
+    # one: the port reachable, `podman --remote` answering over it, a container
+    # spawned through that. So TCP is not a tidier spelling of the socket --
+    # from the one place that matters the socket never worked at all, and the
+    # `shell` hatch below, which runs outside the sandbox, is the only reason it
+    # looked as though it did.
+    #
+    # What that costs, said here rather than left to be discovered: the socket
+    # carried a permission gate in the filesystem -- it was `srw------- claude
+    # claude`, so only this user could connect -- and a port carries none.
+    # Anything in this container's network namespace can now drive the engine.
+    # Inside this container that is a modest change, because the threat model
+    # already accepts more: a container the agent starts is outside Claude's
+    # sandbox anyway. It is still a real difference, not a wash.
+    #
+    # The port is a fixed 2375, which looks unsafe and is not. run-claude.sh
+    # does not pass --network=host, so every claude container has its own
+    # network namespace and therefore its own loopback -- measured: two
+    # concurrent sessions each bound 127.0.0.1:2375 at the same time, neither
+    # saw the other's service, and nothing was bound on the host at all. There
+    # is no arbitration to do and no collision to avoid. --network host is the
+    # one mode that would end that, by putting this listener on the host's
+    # loopback among every other process on the machine, and run-claude.sh
+    # refuses it under --containers for exactly this reason. 2375 is the
+    # conventional Docker API port, chosen so that it is recognisable on sight
+    # in a diagnostic.
+    #
+    # XDG_RUNTIME_DIR did not go with the socket. Rootless podman keeps its
+    # runtime state under it -- the storage runroot, the pause process --
+    # however the API is served, and wants the directory to be the user's own
+    # and unreachable by anyone else. Section 8 of the Dockerfile creates it and
+    # podman's tmpcopyup /run carries it into the running container, but
+    # recreating it costs nothing and this does not have to depend on that. What
+    # has gone is only the socket file, and the directory under it that had to
+    # exist because bind(2) does not create parents.
     #
     # The mkdir and chmod are inside the background command so that their
     # output, and not only podman's, ends up in the log the diagnostic below
     # prints.
-    PODMAN_SOCKET="${XDG_RUNTIME_DIR:-}/podman/podman.sock"
-    PODMAN_SOCKET_DIR="$(dirname "$PODMAN_SOCKET")"
+    PODMAN_SERVICE_HOST=127.0.0.1
+    PODMAN_SERVICE_PORT=2375
+    PODMAN_SERVICE_ADDR="tcp://$PODMAN_SERVICE_HOST:$PODMAN_SERVICE_PORT"
     PODMAN_SERVICE_LOG="/tmp/podman-service.log"
     PODMAN_SERVICE_TIMEOUT=15
 
@@ -67,9 +99,9 @@ if [ "${CLAUDE_TOOLS_CONTAINERS:-}" = "1" ]; then
     # command stays in this shell's process group, and the interactive bash of
     # the `shell` hatch below IS this shell -- the terminal's foreground process
     # group. A Ctrl-C at that prompt, clearing a half-typed line, would then go
-    # to the service as well, which shuts down and unlinks its socket. Nothing
+    # to the service as well, which shuts down and stops listening. Nothing
     # would say so: the entrypoint is long gone, and CONTAINER_HOST and
-    # DOCKER_HOST would still point at a path with nothing behind it. Job
+    # DOCKER_HOST would still point at a port with nothing behind it. Job
     # control puts the service in a process group of its own, out of reach of
     # that signal, and is switched off again at once so nothing else changes.
     #
@@ -78,39 +110,61 @@ if [ "${CLAUDE_TOOLS_CONTAINERS:-}" = "1" ]; then
     # is off, so with `set -m` the service would otherwise read the terminal in
     # competition with claude.
     set -m
-    { mkdir -p "$PODMAN_SOCKET_DIR" \
-        && chmod 700 "${XDG_RUNTIME_DIR:-}" "$PODMAN_SOCKET_DIR" \
-        && exec podman system service --time=0 "unix://$PODMAN_SOCKET"; } \
+    { mkdir -p "${XDG_RUNTIME_DIR:-}" \
+        && chmod 700 "${XDG_RUNTIME_DIR:-}" \
+        && exec podman system service --time=0 "$PODMAN_SERVICE_ADDR"; } \
         </dev/null >"$PODMAN_SERVICE_LOG" 2>&1 &
     PODMAN_SERVICE_PID=$!
     set +m
 
-    # Wait for the socket rather than sleeping a fixed amount: the service is
-    # usually listening in well under a second, but the first run against an
-    # empty image-store volume has to initialize the store. The ceiling is
-    # generous for that; the loop also stops the moment the service process is
-    # gone, which is what a service that dies on startup does almost at once.
+    # Readiness is a connection now, because there is no file to look for: a
+    # listening port is only knowable by connecting to it. bash's /dev/tcp does
+    # that with nothing installed -- no curl, no nc, no podman round-trip -- and
+    # it is the same connect(2) a client will make. The connection is dropped
+    # again immediately; the service sees a client that hung up before sending a
+    # request.
+    #
+    # The subshell is load-bearing under `set -e`, not a habit: a failed
+    # redirection on `exec` ends the shell that runs it, and a failed connection
+    # is the expected answer for as long as the service is still starting, so it
+    # has to end a shell that can be spared. errexit does not fire on the
+    # non-zero result either -- both callers below put this in a condition,
+    # where errexit is suspended for the whole list, function body included --
+    # but that is a property of the callers, so do not move this call somewhere
+    # its result is not tested.
+    podman_api_reachable() {
+        (exec 3<>"/dev/tcp/$PODMAN_SERVICE_HOST/$PODMAN_SERVICE_PORT") 2>/dev/null
+    }
+
+    # Wait for the service rather than sleeping a fixed amount: it is usually
+    # listening in well under a second, but the first run against an empty
+    # image-store volume has to initialize the store. The ceiling is generous
+    # for that; the loop also stops the moment the service process is gone,
+    # which is what a service that dies on startup does almost at once.
     waited=0
-    while [ ! -S "$PODMAN_SOCKET" ] \
+    while ! podman_api_reachable \
         && [ "$waited" -lt "$((PODMAN_SERVICE_TIMEOUT * 10))" ] \
         && kill -0 "$PODMAN_SERVICE_PID" 2>/dev/null; do
         sleep 0.1
         waited=$((waited + 1))
     done
 
-    if [ -S "$PODMAN_SOCKET" ] && kill -0 "$PODMAN_SERVICE_PID" 2>/dev/null; then
-        # Exported only now that the socket is there AND the service behind it
-        # still is -- an inode outlives a process that died after bind without
-        # unlinking, and pointing the variables at that is the very thing this
-        # is meant to avoid. CONTAINER_HOST
-        # points the podman CLI at the service; DOCKER_HOST is not an engine
-        # choice but what foreign code -- Testcontainers, dockerode, docker-py --
-        # reads to find the Docker-compatible API. Pointing either at a socket
-        # that does not exist would turn "no engine here" into a connection
-        # error against a path, which is harder to read, so on failure they stay
-        # unset.
-        export CONTAINER_HOST="unix://$PODMAN_SOCKET"
-        export DOCKER_HOST="unix://$PODMAN_SOCKET"
+    if podman_api_reachable && kill -0 "$PODMAN_SERVICE_PID" 2>/dev/null; then
+        # Exported only now that the port answers AND the service behind it is
+        # still there. The socket's stale-inode hazard -- a file outliving the
+        # process that died after bind without unlinking -- has no counterpart
+        # here, a listener dies with its process; the liveness check earns its
+        # keep differently, as what tells "the loop ended because the API
+        # answered" apart from "the loop ended because the service went away".
+        #
+        # CONTAINER_HOST points the podman CLI at the service; DOCKER_HOST is
+        # not an engine choice but what foreign code -- Testcontainers,
+        # dockerode, docker-py -- reads to find the Docker-compatible API.
+        # Pointing either at an address with nothing behind it would turn "no
+        # engine here" into a connection error against a port, which is harder
+        # to read, so on failure they stay unset.
+        export CONTAINER_HOST="$PODMAN_SERVICE_ADDR"
+        export DOCKER_HOST="$PODMAN_SERVICE_ADDR"
     else
         # Not fatal, deliberately. Claude is perfectly usable without an engine,
         # and a container that refused to start would be a far worse outcome
@@ -129,7 +183,8 @@ if [ "${CLAUDE_TOOLS_CONTAINERS:-}" = "1" ]; then
         # the message says what is actually known -- the variables are unset --
         # rather than that the service will never arrive.
         echo "warning: the podman API service was not ready within ${PODMAN_SERVICE_TIMEOUT}s --" >&2
-        echo "         no socket at $PODMAN_SOCKET, or the service behind it is gone" >&2
+        echo "         nothing is listening on $PODMAN_SERVICE_ADDR, or the" >&2
+        echo "         service that was listening there is gone" >&2
         echo "         CONTAINER_HOST and DOCKER_HOST are therefore left unset, so" >&2
         echo "         nothing will find an engine; claude itself is unaffected" >&2
         if [ -s "$PODMAN_SERVICE_LOG" ]; then
@@ -179,7 +234,7 @@ esac
 # service further up was started before the drop and keeps its own set, so it
 # can still map subuids and spawn containers while claude, and everything
 # claude spawns, run with none. That split is this design rather than a
-# workaround for it -- clients speak to the service over the socket instead of
+# workaround for it -- clients speak to the service over the API instead of
 # driving the engine themselves.
 #
 # All three capability sets have to go. Ambient is how the capabilities arrive
