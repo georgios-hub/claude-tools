@@ -156,9 +156,10 @@ RUN { \
       echo 'export NPM_CONFIG_PREFIX="$HOME/.npm-global"'; \
       echo 'export PYENV_ROOT="$HOME/.pyenv"'; \
       echo 'export SDKMAN_DIR="$HOME/.sdkman"'; \
-      echo 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PYENV_ROOT/bin:$PATH"'; \
+      echo 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PYENV_ROOT/shims:$PYENV_ROOT/bin:$PATH"'; \
       echo ''; \
-      echo '# pyenv shims are already on PATH from the image, so only interactive'; \
+      echo '# The PATH above carries the shims because /etc/profile resets PATH in a login'; \
+      echo '# shell, losing the ones the image exports. With them there, only interactive'; \
       echo '# shells pay for the full init (completion plus the `pyenv shell` command).'; \
       echo 'case $- in'; \
       echo '    *i*)'; \
