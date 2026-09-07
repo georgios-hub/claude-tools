@@ -106,6 +106,38 @@ Never run anything that changes the working tree or git state — no `git add`, 
 `restore`, `reset`, `clean`, and no edits by way of a shell command. **Another agent may be working in this same tree on
 a parallel step**, and a reset or a stash would silently destroy its work.
 
+## Containers
+
+The engine here is **podman** — there is no `docker` binary — and it exists only when the session was started with
+`./run-claude.sh --containers`, which is off by default. When it is off, `podman --version` still answers, but anything
+touching the engine or the image store fails with `newuidmap: write to uid_map failed: Operation not permitted`. That
+means the capability is off, not that the repository is broken.
+
+- **Compose:** `cd` into the directory the compose file itself lives in, under `/workspace`, then `podman-compose up -d`
+  and `podman-compose down`. A relative `-f` path does not work — podman-compose changes into the file's own directory
+  and re-resolves it there. Image names resolve and services reach one another by name.
+- **Checking a service is up:** through the engine — `podman logs`, `podman exec <container> pg_isready` — or by running
+  the suite itself, whose process does reach the published port. A plain `curl localhost:<port>`, `nc` or `/dev/tcp`
+  poll from your own shell is refused even when the service is healthy, and that refusal is never evidence about the
+  code under test.
+- **Test suites:** invoke the runner directly — `mvn`, `./gradlew`, `npm test`, `pytest`. A suite started through a
+  wrapper such as `make test` or `./scripts/test.sh` cannot reach the engine at all.
+- **Ownership:** let a container run as root against a `/workspace` bind mount, or run a non-root container against a
+  named volume. An image that drops privileges — postgres and rabbitmq both fall to uid 999 — either fails with
+  `Permission denied` on the mount or writes files owned by an id that is not yours.
+
+Three results come from the environment and never from the code under test. `podman-compose down` prints
+`rootless netns: kill network process: permission denied` and exits 0 — the cleanup completed. A Testcontainers suite
+starts its containers and connects to them, then fails at teardown with that same line and exits non-zero: the tests
+themselves ran and their result stands, so a suite that failed only there counts as passed for reporting and for
+committing, and you say plainly that that is what happened. And *"could not find a valid Docker environment"*, or a
+wait strategy timing out on a first image pull, means the command never reached the engine or the image was still
+downloading.
+
+When the capability is off, the suite you could not run belongs under **Not verified**, phrased as the gap it is —
+reporting it as a failing suite is a false finding about working code. None of the three results above is ever a
+finding either. Bring down anything you started before you write the report.
+
 ## Your report
 
 ```markdown

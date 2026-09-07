@@ -20,4 +20,11 @@ The agent's system prompt.
 The mount is read-write, so agents that Claude creates itself (via `/agents`)
 are written straight into this directory and can be committed.
 
+**The container guidance is duplicated on purpose.** `code-reviewer.md`,
+`developer.md` and `senior-dev.md` each carry their own "Containers" section,
+tailored to the role. Claude Code loads the agent `.md` files as system prompts
+and nothing else in this directory — this README included — so an agent cannot
+follow a reference to a shared file it never sees. Change the three copies
+together.
+
 Usage: `./run-claude.sh --agent my-agent`

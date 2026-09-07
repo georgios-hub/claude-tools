@@ -89,6 +89,39 @@ Report the real result. If something fails, say which and why. If you could not 
 implying you did. **Never commit work you have not verified**, and never describe a task as done when a check did not
 pass.
 
+## Containers
+
+The engine here is **podman** — there is no `docker` binary — and it exists only when the session was started with
+`./run-claude.sh --containers`, which is off by default. When it is off, `podman --version` still answers, but anything
+touching the engine or the image store fails with `newuidmap: write to uid_map failed: Operation not permitted`. That
+means the capability is off, not that the repository is broken.
+
+- **Compose:** `cd` into the directory the compose file itself lives in, under `/workspace`, then `podman-compose up -d`
+  and `podman-compose down`. A relative `-f` path does not work — podman-compose changes into the file's own directory
+  and re-resolves it there. Image names resolve and services reach one another by name.
+- **Checking a service is up:** through the engine — `podman logs`, `podman exec <container> pg_isready` — or by running
+  the suite itself, whose process does reach the published port. A plain `curl localhost:<port>`, `nc` or `/dev/tcp`
+  poll from your own shell is refused even when the service is healthy, and that refusal is never evidence about the
+  code under test.
+- **Test suites:** invoke the runner directly — `mvn`, `./gradlew`, `npm test`, `pytest`. A suite started through a
+  wrapper such as `make test` or `./scripts/test.sh` cannot reach the engine at all.
+- **Ownership:** let a container run as root against a `/workspace` bind mount, or run a non-root container against a
+  named volume. An image that drops privileges — postgres and rabbitmq both fall to uid 999 — either fails with
+  `Permission denied` on the mount or writes files owned by an id that is not yours.
+
+Three results come from the environment and never from the code under test. `podman-compose down` prints
+`rootless netns: kill network process: permission denied` and exits 0 — the cleanup completed. A Testcontainers suite
+starts its containers and connects to them, then fails at teardown with that same line and exits non-zero: the tests
+themselves ran and their result stands, so a suite that failed only there counts as passed for reporting and for
+committing, and you say plainly that that is what happened. And *"could not find a valid Docker environment"*, or a
+wait strategy timing out on a first image pull, means the command never reached the engine or the image was still
+downloading.
+
+**Never commit what a container created** — data directories, volume leftovers, compose state. Bring down whatever you
+started and run `git status` before you stage. A tree a container created under an id that is not yours may resist
+`rm`; `podman unshare rm -rf <path>` is the thing to try, and it is untested here — which is why the ownership rule
+above is the reliable remedy.
+
 ## Step 5: CHANGELOG and commit
 
 **CHANGELOG** — update it only if the repository has one and the change is worth a reader's attention. Keep it laconic:
