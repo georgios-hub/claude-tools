@@ -39,7 +39,9 @@
 # capabilities apply inside the container's user namespace and not on the host,
 # so they are not host privilege -- but the container is materially less
 # confined than without the flag, which is why it is opt-in. It cannot be
-# combined with --no-sandbox.
+# combined with --no-sandbox, nor with host networking: the container engine
+# API it starts is unauthenticated and is kept private by the container's own
+# network namespace, which --network host takes away.
 #
 # The capability is not the whole cost. The containers the agent starts run
 # outside Claude's sandbox and outside settings.json's deny list, so anything
@@ -94,6 +96,20 @@ if [ "$ENABLE_CONTAINERS" -eq 1 ] && [ "$ENABLE_SANDBOX" -eq 0 ]; then
     echo "error: --containers and --no-sandbox are mutually exclusive" >&2
     echo "       the inner podman needs the seccomp=unconfined and unmask=ALL" >&2
     echo "       that --no-sandbox drops" >&2
+    exit 1
+fi
+
+# Host networking is refused for the same reason it is checked here: the podman
+# API service the entrypoint starts is unauthenticated, and the only thing that
+# keeps it private is the container having a network namespace of its own.
+# NETWORK_MODE is read after parsing, so this catches --network host and
+# CLAUDE_TOOLS_NETWORK alike, whatever order the flags came in.
+if [ "$ENABLE_CONTAINERS" -eq 1 ] && [ "$NETWORK_MODE" = "host" ]; then
+    echo "error: --containers and --network host are mutually exclusive" >&2
+    echo "       the container engine API the entrypoint starts has no" >&2
+    echo "       authentication, and only the container's own network namespace" >&2
+    echo "       keeps it private; on host networking every process on the host" >&2
+    echo "       could drive it" >&2
     exit 1
 fi
 
@@ -164,8 +180,10 @@ fi
 # a podman API service that docker-entrypoint.sh starts when it sees
 # CLAUDE_TOOLS_CONTAINERS set to 1 -- the value is the contract, and it is this
 # flag's only trigger. CONTAINER_HOST and DOCKER_HOST are deliberately not set
-# here: the entrypoint exports them once it has confirmed the socket is there,
-# so a service that failed to start never leaves them pointing at nothing.
+# here: the entrypoint exports them, pointing at the loopback address the API
+# service listens on, only once it has confirmed the service is answering
+# there -- so a service that failed to start never leaves them pointing at
+# nothing.
 #
 # --cap-add=all is a genuine security concession, and the reason this is opt-in
 # rather than always on. Without it the inner podman cannot map its subuid
