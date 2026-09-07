@@ -161,4 +161,53 @@ case "${1:-}" in
         ;;
 esac
 
-exec claude "$@"
+# Drop every capability before starting claude. Claude's sandbox is bubblewrap,
+# and bubblewrap refuses to run at all while it holds capabilities without
+# being setuid:
+#
+#   bwrap: Unexpected capabilities but not setuid, old file caps config?
+#
+# Under --containers this container is started with --cap-add=all -- the inner
+# podman needs it to map its subuid range -- and podman hands an unprivileged
+# user those capabilities through the ambient set, which every process in here
+# then inherits. So bubblewrap fails on EVERY Bash call, a bare `echo` exactly
+# like a `podman` one, and the agent's Bash tool can run nothing at all. Delete
+# the exec below and that is the symptom, in a message that names bubblewrap
+# and does not name this file.
+#
+# Capabilities are per-process, which is what makes this cost nothing: the API
+# service further up was started before the drop and keeps its own set, so it
+# can still map subuids and spawn containers while claude, and everything
+# claude spawns, run with none. That split is this design rather than a
+# workaround for it -- clients speak to the service over the socket instead of
+# driving the engine themselves.
+#
+# All three capability sets have to go. Ambient is how the capabilities arrive
+# here in the first place, and clearing it is what leaves the exec'd process
+# with an empty permitted and effective set; inheritable is the other route
+# across an exec; the bounding set is what stops anything downstream regaining
+# them. setpriv comes from util-linux, which is Essential in Debian and so is
+# already in the image -- no package was added for this.
+#
+# The dry run against `true` is load-bearing rather than caution. Dropping the
+# bounding set needs CAP_SETPCAP, so without --containers -- the ordinary run,
+# where there are no capabilities to drop in the first place -- setpriv exits
+# 127 with `setpriv: apply bounding set: Operation not permitted`. exec leaves
+# no way back from that, and claude would simply never start on the commoner of
+# the two paths. Trying the identical invocation first, and falling back to a
+# plain exec, keeps that run exactly as it was, and covers a missing or broken
+# setpriv on the same non-fatal principle as the service above: Claude without
+# an engine is usable, Claude that does not start is not.
+#
+# This sits after the shell/bash/sh hatch above and not before it. The
+# asymmetry is deliberate -- do not harmonise it away. That hatch is where a
+# human debugs, `--containers shell` is the diagnostic path this feature is
+# triaged from, and it is the capabilities that let the local podman CLI work
+# there. Claude gets a clean environment; the debugging shell keeps its
+# privilege.
+CAP_DROP=(setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all)
+if ! "${CAP_DROP[@]}" true 2>/dev/null; then
+    CAP_DROP=()
+fi
+
+exec "${CAP_DROP[@]}" claude "$@"
