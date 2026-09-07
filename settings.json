@@ -1,5 +1,5 @@
 {
-  "$comment": "~/.claude/settings.json — global. Purpose: minimal prompts for reads inside the current working directory. Precedence: deny > ask > allow.",
+  "$comment": "~/.claude/settings.json — global. Purpose: minimal prompts for reads inside the current working directory. Precedence: deny > ask > allow. sandbox.excludedCommands: these run OUTSIDE Claude's sandbox. On Linux the sandbox isolates the network namespace, so a sandboxed command reaches neither the podman socket nor 127.0.0.1:2375, and no sandbox setting bridges that — exclusion is the only mechanism that works. The test runners are excluded too, because the JVM or node process they start is what talks to the engine. Cost: those commands may write outside /workspace. Not a credential cost — the sandbox never confined ~/.claude. They also need matching permissions.allow entries: autoAllowBashIfSandboxed only auto-approves commands that ARE sandboxed.",
 
   "permissions": {
     "defaultMode": "default",
@@ -49,6 +49,9 @@
       "Bash(git ls-files)",
       "Bash(git fetch *)",
       "Bash(git fetch)",
+
+      "Bash(podman *)",
+      "Bash(podman-compose *)",
 
       "Bash(pytest)",
       "Bash(pytest *)",
@@ -252,7 +255,53 @@
         "~/.pgpass",
         "~/.config/gh"
       ]
-    }
+    },
+    "excludedCommands": [
+      "podman *",
+      "podman-compose *",
+
+      "pytest",
+      "pytest *",
+      "python -m pytest*",
+      "python3 -m pytest*",
+      "tox",
+      "tox *",
+      "nox",
+      "nox *",
+
+      "mvn test*",
+      "mvn clean test*",
+      "mvn verify*",
+      "mvn clean verify*",
+      "mvn surefire:test*",
+      "mvn failsafe:*",
+      "mvn -D* test*",
+      "mvn -P* test*",
+      "./mvnw test*",
+      "./mvnw clean test*",
+      "./mvnw verify*",
+      "./mvnw clean verify*",
+      "./mvnw -D* test*",
+      "./mvnw -P* test*",
+      "./gradlew test*",
+      "./gradlew clean test*",
+      "./gradlew check*",
+      "./gradlew build*",
+      "./gradlew clean build*",
+      "./gradlew integrationTest*",
+      "gradle test*",
+      "gradle check*",
+      "gradle build*",
+
+      "npm test*",
+      "npm run test*",
+      "npm run e2e*",
+      "npm run cypress*",
+      "yarn test*",
+      "yarn e2e*",
+      "pnpm test*",
+      "pnpm e2e*"
+    ]
   },
 
   "theme": "dark"
