@@ -129,14 +129,16 @@ above is the reliable remedy.
 **one sentence per entry**, written from the reader's point of view. What changed, not why, not how. No nested bullets
 under a single change.
 
-**Commit** — the message is **a short title and nothing else**:
+**Commit** — the message is **a short title, optionally a short description, and nothing else**:
 
-- **Short.** One line that says what changed, in the imperative. Keep it under roughly 70 characters — if it does not
+- **Title.** One line that says what changed, in the imperative. Keep it under roughly 70 characters — if it does not
   fit, the commit is doing too much, so split it rather than lengthening the title.
-- **No new lines.** The whole message is a single line — a lone `-m "<title>"`. No blank line, no body, no bullet list,
-  no footer. Never pass a second `-m`, a here-doc or an embedded `\n`.
-- **No authors.** No `Co-Authored-By`, no `Signed-off-by`, no `Generated with`, no session link, no tool or model name,
-  no emoji standing in for one. Nothing about who or what wrote the commit — git already records the author.
+- **Description, only when the title is not enough.** At most **two sentences** of plain prose after a blank line,
+  saying what a reader of the title would still want to know. No bullet list, no headings, no footer. When the title
+  already says it all, the message is the title alone — a lone `-m "<title>"`.
+- **No author signature of any kind, whoever the author is** — not the user, not Claude Code, not you. No
+  `Co-Authored-By`, no `Signed-off-by`, no `Generated with`, no session link, no tool or model name, no emoji standing
+  in for one. Nothing about who or what wrote the commit — git already records the author.
 
 Match the repository's existing style within that: read `git log --oneline -20` and follow the prefix, casing and mood
 you find there rather than importing a convention it does not use.

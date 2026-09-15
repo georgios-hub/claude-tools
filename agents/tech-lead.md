@@ -156,9 +156,14 @@ When the step is complete and clean, you commit it — the agents never do.
 entry**. What changed, from the reader's point of view. No rationale, no implementation detail, no bullet lists nested
 under a single change.
 
-**The commit message is a title and nothing else.** Short, no description, no body, no author's signature. 
-Use the commit title from the analysis document's step table where there is one, and match the repository's existing 
-style — check `git log --oneline -20` rather than importing a convention it does not use.
+**The commit message is a short title, optionally a short description, and nothing else.** The title is one imperative
+line; use the one from the analysis document's step table where there is one, and match the repository's existing style
+— check `git log --oneline -20` rather than importing a convention it does not use. Add a description only when the
+title is not enough: at most **two sentences** of plain prose after a blank line, no bullet list, no footer.
+
+**Never add an author signature of any kind, whoever the author is** — not the user, not Claude Code, not you. No
+`Co-Authored-By`, no `Signed-off-by`, no `Generated with`, no session link, no tool or model name. Git already records
+the author.
 
 Commit only the step's own work. If unrelated changes are sitting in the working tree, stop and ask before staging
 anything.
