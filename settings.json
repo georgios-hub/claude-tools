@@ -1,16 +1,10 @@
 {
   "$comment": "~/.claude/settings.json — global. Purpose: minimal prompts for reads inside the current working directory. Precedence: deny > ask > allow. sandbox.excludedCommands: these run OUTSIDE Claude's sandbox. On Linux the sandbox isolates the network namespace, so a sandboxed command reaches neither the podman socket nor 127.0.0.1:2375, and no sandbox setting bridges that — exclusion is the only mechanism that works. The test runners are excluded too, because the JVM or node process they start is what talks to the engine. Cost: those commands may write outside /workspace. Not a credential cost — the sandbox never confined ~/.claude. They also need matching permissions.allow entries: autoAllowBashIfSandboxed only auto-approves commands that ARE sandboxed.",
-
   "permissions": {
-    "defaultMode": "default",
-
-    "additionalDirectories": [],
-
     "allow": [
       "Read(./**)",
       "Edit(./**)",
       "Read(~/.sdkman/**)",
-
       "Bash(ls *)",
       "Bash(cat *)",
       "Bash(head *)",
@@ -32,7 +26,6 @@
       "Bash(realpath *)",
       "Bash(basename *)",
       "Bash(dirname *)",
-
       "Bash(git status *)",
       "Bash(git status)",
       "Bash(git diff *)",
@@ -49,10 +42,9 @@
       "Bash(git ls-files)",
       "Bash(git fetch *)",
       "Bash(git fetch)",
-
+      "Bash(git commit *)",
       "Bash(podman *)",
       "Bash(podman-compose *)",
-
       "Bash(pytest)",
       "Bash(pytest *)",
       "Bash(python -m pytest*)",
@@ -90,9 +82,7 @@
       "Bash(poetry show*)",
       "Bash(uv run pytest*)",
       "Bash(uv pip list*)",
-
       "Bash(ansible-playbook --syntax-check *)",
-
       "Bash(mvn test*)",
       "Bash(mvn clean test*)",
       "Bash(mvn verify*)",
@@ -143,7 +133,6 @@
       "Bash(gradle build*)",
       "Bash(gradle tasks*)",
       "Bash(gradle --version)",
-
       "Bash(npm test*)",
       "Bash(npm run test*)",
       "Bash(npm run lint*)",
@@ -184,7 +173,6 @@
       "Bash(vitest run*)",
       "Bash(node --version)"
     ],
-
     "deny": [
       "Read(~/.ssh/**)",
       "Read(~/.aws/**)",
@@ -199,20 +187,15 @@
       "Read(~/.pgpass)",
       "Read(~/.config/gh/**)",
       "Bash(sudo *)",
-
       "Edit(./.env)",
       "Edit(./.env.*)",
       "Edit(./.git/**)"
     ],
-
     "ask": [
-      "Bash(rm *)",
       "Bash(git push *)",
       "Bash(git push)",
-      "Bash(git commit *)",
       "Bash(git reset --hard *)",
       "Bash(git clean *)",
-
       "Bash(mvn deploy*)",
       "Bash(mvn release:*)",
       "Bash(./mvnw deploy*)",
@@ -232,15 +215,14 @@
       "Bash(./mvnw spring-boot:run*)",
       "Bash(./gradlew bootRun*)",
       "Bash(gradle bootRun*)"
-
-    ]
+    ],
+    "defaultMode": "default",
+    "additionalDirectories": []
   },
-
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "filesystem": {
-      "allowRead": [],
       "denyRead": [
         "~/.ssh",
         "~/.aws",
@@ -254,12 +236,12 @@
         "~/.netrc",
         "~/.pgpass",
         "~/.config/gh"
-      ]
+      ],
+      "allowRead": []
     },
     "excludedCommands": [
       "podman *",
       "podman-compose *",
-
       "pytest",
       "pytest *",
       "python -m pytest*",
@@ -268,7 +250,6 @@
       "tox *",
       "nox",
       "nox *",
-
       "mvn test*",
       "mvn clean test*",
       "mvn verify*",
@@ -292,7 +273,6 @@
       "gradle test*",
       "gradle check*",
       "gradle build*",
-
       "npm test*",
       "npm run test*",
       "npm run e2e*",
@@ -303,6 +283,37 @@
       "pnpm e2e*"
     ]
   },
-
-  "theme": "dark"
+  "theme": "dark",
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true,
+  "autoMode": {
+    "environment": [
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: assume private unless the remote host and repo name indicate otherwise, or a visibility check in the transcript shows public — no remote configured for this repo, so this cannot be verified; treat as private local project",
+      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: None configured — repo uses a local .env file (gitignored) for POSTGRES_* and SECRET_KEY",
+      "**Default / protected branches**: not queryable (no remote configured)",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Host containment**: None configured — assume Claude Code runs on an ordinary developer machine or CI runner with open internet",
+      "**Source control**: The trusted repo only (no remotes configured, no additional orgs configured)",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: .env and .env.sample (PostgreSQL credentials, SECRET_KEY); any file or store holding personal data, confidential business data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and share only with audiences cleared at the [named+specifics] bar",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment",
+      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: software development (FastAPI camera-streaming service, videosrv)",
+      "**Trusted repo**: The git repository at /workspace (its working directory) — no remotes configured",
+      "**Org-specific CLiIs**: None configured",
+      "**Org-specific CLIs**: None configured (podman/podman-compose used frequently but appear to be general container tooling, not org-specific)"
+    ]
+  },
+  "$comment": "~/.claude/settings.json — global. Purpose: minimal prompts for reads inside the current working directory. Precedence: deny > ask > allow. sandbox.excludedCommands: these run OUTSIDE Claude's sandbox. On Linux the sandbox isolates the network namespace, so a sandboxed command reaches neither the podman socket nor 127.0.0.1:2375, and no sandbox setting bridges that — exclusion is the only mechanism that works. The test runners are excluded too, because the JVM or node process they start is what talks to the engine. Cost: those commands may write outside /workspace. Not a credential cost — the sandbox never confined ~/.claude. They also need matching permissions.allow entries: autoAllowBashIfSandboxed only auto-approves commands that ARE sandboxed."
 }
